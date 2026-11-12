@@ -50,6 +50,10 @@ func TestSingBoxFullConfig(t *testing.T) {
 		SingBoxTUICInbound("in-tuic", 10015, "test.example.com", certPath, keyPath, TUICConfig{UUID: uuid, Password: "tuicpass"}),
 		SingBoxAnyTLSInbound("in-anytls", 10016, "test.example.com", certPath, keyPath, AnyTLSConfig{Name: "anyuser", Password: "anypass"}),
 		SingBoxNaiveInbound("in-naive", 10017, NaiveConfig{Username: "naiveuser", Password: "naivepass", Domain: "test.example.com"}, certPath, keyPath),
+		SingBoxSnellInbound("in-snell-v5", 10019, SnellConfig{Version: 5, PSK: "snelltestpsk1234567890abcdef", ObfsMode: "http", ObfsHost: "bing.com"}),
+		SingBoxSnellInbound("in-snell-v6", 10020, SnellConfig{Version: 6, PSK: "snelltestpsk1234567890abcdef", Mode: "default"}),
+		SingBoxShadowTLSInbound("in-shadowtls", 10021, ShadowTLSConfig{Password: "stpass1234567890", Handshake: "gateway.icloud.com", StrictMode: true, SSMethod: "2022-blake3-aes-128-gcm", SSPassword: "AAAAAAAAAAAAAAAAAAAAAA==", InnerPort: 20001}),
+		SingBoxShadowTLSInnerSS("in-shadowtls-ss", ShadowTLSConfig{SSMethod: "2022-blake3-aes-128-gcm", SSPassword: "AAAAAAAAAAAAAAAAAAAAAA==", InnerPort: 20001}),
 	)
 	endpoints := []interface{}{
 		SingBoxWGEndpoint("wg-1", 10018, WGConfig{ServerPriv: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", ServerPub: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", ClientPub: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", ClientIP: "10.0.0.2/32"}),
@@ -122,5 +126,32 @@ func TestSingBoxFullConfig(t *testing.T) {
 	bad := `{"protocol":"vless","settings":{"vnext":[{"address":"203.0.113.10","port":443,"users":[{"id":"` + uuid + `"}]}]},"streamSettings":{"network":"kcp","security":"none"}}`
 	if _, err := SingBoxBOutbound("vless", bad, "chain-bad"); err == nil {
 		t.Errorf("不支持的 B 节点传输应报错，却通过了")
+	}
+	// 断言 4：Snell 链接里的 version 是客户端版本——v5 服务端
+	// 配 v4 客户端（sing-box 出站只认 4/6，写 5 会炸订阅解析），
+	// v6 服务端配 v6；v5 链接仍带 http 混淆。
+	l5 := SnellLink("203.0.113.20", 10019, SnellConfig{Version: 5, PSK: "snelltestpsk1234567890abcdef", ObfsMode: "http", ObfsHost: "bing.com"}, "snell-v5")
+	if !strings.Contains(l5, "snell://") || !strings.Contains(l5, "version=4") || strings.Contains(l5, "version=5") || !strings.Contains(l5, "obfs=http") || !strings.Contains(l5, "obfs-host=bing.com") {
+		t.Errorf("Snell v5 链接不对：%s", l5)
+	}
+	l6 := SnellLink("203.0.113.20", 10020, SnellConfig{Version: 6, PSK: "snelltestpsk1234567890abcdef", Mode: "default"}, "snell-v6")
+	if !strings.Contains(l6, "version=6") || !strings.Contains(l6, "mode=default") {
+		t.Errorf("Snell v6 链接不对：%s", l6)
+	}
+	// 断言 5：ShadowTLS 客户端 JSON 必须是两个出站，SS detour 到 ShadowTLS
+	stJSON := ShadowTLSClientJSON("203.0.113.21", 10021, ShadowTLSConfig{Password: "stpass1234567890", Handshake: "gateway.icloud.com", SSMethod: "2022-blake3-aes-128-gcm", SSPassword: "AAAAAAAAAAAAAAAAAAAAAA=="}, "shadowtls-1")
+	var stDoc struct {
+		Outbounds []struct {
+			Type    string `json:"type"`
+			Tag     string `json:"tag"`
+			Detour  string `json:"detour"`
+			Version int    `json:"version"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal([]byte(stJSON), &stDoc); err != nil {
+		t.Fatalf("ShadowTLS 客户端 JSON 解析失败：%v", err)
+	}
+	if len(stDoc.Outbounds) != 2 || stDoc.Outbounds[0].Type != "shadowsocks" || stDoc.Outbounds[1].Type != "shadowtls" || stDoc.Outbounds[1].Version != 3 || stDoc.Outbounds[0].Detour != stDoc.Outbounds[1].Tag {
+		t.Errorf("ShadowTLS 客户端 JSON 结构不对：%s", stJSON)
 	}
 }

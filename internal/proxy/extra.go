@@ -72,7 +72,11 @@ func Hy2ServerYAML(port int, certPath, keyPath string, cfg Hy2Config) string {
 }
 
 func Hy2Link(address string, port int, sni string, cfg Hy2Config, name string) string {
-	v := "sni=" + qesc(sni) + "&insecure=1"
+	// security=tls：HY2 本来就是全程 TLS，但官方 URI 方案里没有 security
+	// 参数，有些客户端靠它决定要不要生成 TLS 块，缺了就下发无 TLS 的出站、
+	// 连不上；带上对 sing-box/mihomo 等解析器无害（未知参数直接忽略，
+	// HiddifyCli 与 mihomo 实测通过）。
+	v := "security=tls&sni=" + qesc(sni) + "&insecure=1"
 	if cfg.ObfsType != "" {
 		v += "&obfs=" + qesc(cfg.ObfsType)
 		if cfg.ObfsPassword != "" {
@@ -87,7 +91,7 @@ func Hy2Link(address string, port int, sni string, cfg Hy2Config, name string) s
 	if _, _, err := ParseHopPorts(cfg.HopPorts); err == nil {
 		v += "&mport=" + qesc(cfg.HopPorts) + "&ports=" + qesc(cfg.HopPorts)
 	}
-	return fmt.Sprintf("hysteria2://%s@%s/?%s#%s", qesc(cfg.Password), hostPort(address, port), v, qesc(name))
+	return fmt.Sprintf("hysteria2://%s@%s?%s#%s", qesc(cfg.Password), hostPort(address, port), v, qesc(name))
 }
 
 // GenSelfSignedCert creates a self-signed cert/key pair (for hy2).

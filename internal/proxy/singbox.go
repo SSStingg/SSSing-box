@@ -57,6 +57,220 @@ func DefaultNaive() NaiveConfig {
 	return NaiveConfig{Username: "user-" + randHex(3), Password: randHex(8)}
 }
 
+// ---------- Snell ----------
+//
+// 预设就是最佳档：默认 v5（稳定、客户端支持最广）+ HTTP 混淆
+// （obfs_host bing.com），v6 可手动切（流量整形内置，
+// 但还是 beta）。v5 服务端接受 v4/v5 客户端（两者线格式相同，
+// sing-box 不提供单独的 v4 服务端）；v6 的 PSK 必须是 12-255 字节。
+// 注意：入站没有 obfs_host 字段（那是客户端出站字段），
+// 混淆 Host 只进链接，不进服务端配置。
+
+type SnellConfig struct {
+	Version  int    `json:"version"` // 5 | 6，默认 5
+	PSK      string `json:"psk"`
+	ObfsMode string `json:"obfs_mode"` // v5：none | http，默认 http
+	ObfsHost string `json:"obfs_host"` // v5 http 混淆 Host，默认 bing.com（只进链接）
+	Mode     string `json:"mode"`      // v6：default | unshaped | unsafe-raw，默认 default
+	Listen   string `json:"listen"`
+}
+
+func DefaultSnell() SnellConfig {
+	return SnellConfig{Version: 5, PSK: randHex(16), ObfsMode: "http", ObfsHost: "bing.com", Mode: "default"}
+}
+
+// SingBoxSnellInbound：version 非 5/6 时按 5 处理（归一化层已拦，
+// 这里是最后一道防线，不让非法值进 sing-box 校验）。
+func SingBoxSnellInbound(tag string, port int, cfg SnellConfig) map[string]interface{} {
+	ver := cfg.Version
+	if ver != 5 && ver != 6 {
+		ver = 5
+	}
+	in := map[string]interface{}{
+		"type":        "snell",
+		"tag":         tag,
+		"listen":      sbListen(cfg.Listen, "::"),
+		"listen_port": port,
+		"version":     ver,
+		"psk":         cfg.PSK,
+	}
+	if ver == 5 {
+		mode := cfg.ObfsMode
+		if mode == "" {
+			mode = "http"
+		}
+		in["obfs_mode"] = mode
+	} else {
+		mode := cfg.Mode
+		if mode == "" {
+			mode = "default"
+		}
+		in["mode"] = mode
+	}
+	return in
+}
+
+// SnellLink：生态通用格式（mihomo/Surge/Stash 通用，
+// sing-box 自身暂不解析 snell:// 链接）。
+// v5 服务端：snell://psk@host:port?version=4&obfs=http&obfs-host=bing.com#name
+// v6 服务端：snell://psk@host:port?version=6&mode=default#name
+// 链接里的 version 必须是客户端版本，不能写服务端版本：
+// sing-box 的 Snell 出站只认 4 和 6，写 5 时 Hiddify 这类
+// sing-box 内核客户端解析订阅、生成运行配置就会炸
+// （snell: unsupported version: 5，2026-11-12 实测）；
+// v4 客户端连 v5 服务端是官方支持的组合，v5 的线上传输
+// 本来就和 v4 相同（只差 QUIC 代理模式，sing-box 不支持它）。
+func SnellLink(address string, port int, cfg SnellConfig, name string) string {
+	ver := cfg.Version
+	if ver != 5 && ver != 6 {
+		ver = 5
+	}
+	// 服务端版本 → 客户端版本：v5 服务端配 v4 客户端，v6 配 v6。
+	urlVer := 4
+	if ver == 6 {
+		urlVer = 6
+	}
+	v := url.Values{}
+	v.Set("version", strconv.Itoa(urlVer))
+	if ver == 5 {
+		mode := cfg.ObfsMode
+		if mode == "" {
+			mode = "http"
+		}
+		if mode == "http" {
+			v.Set("obfs", "http")
+			host := cfg.ObfsHost
+			if host == "" {
+				host = "bing.com"
+			}
+			v.Set("obfs-host", host)
+		}
+	} else {
+		mode := cfg.Mode
+		if mode == "" {
+			mode = "default"
+		}
+		v.Set("mode", mode)
+	}
+	return "snell://" + qesc(cfg.PSK) + "@" + hostPort(address, port) + "?" + v.Encode() + "#" + qesc(name)
+}
+
+// ---------- ShadowTLS ----------
+//
+// 主流最佳架构：ShadowTLS v3（strict_mode）套 SS2022。
+// ShadowTLS 只负责“看起来像真 TLS 握手”（握手直接转发给
+// gateway.icloud.com 这种大站，探测者拿到的是真证书、真页面），
+// 握手后的流量本身不加密——必须套一层 SS 才完整。
+// 所以一个 ShadowTLS 节点 = 两个入站：公网端口的 shadowtls
+// 入站（detour 到内层）+ 只听 127.0.0.1 的 SS 入站（内层，
+// 2022-blake3-aes-128-gcm，端口创建时分配，绝不对外暴露，
+// 否则就是给 GFW 的被动全加密探测留的靶子）。
+// strict_mode 强制开：未通过认证的连接直接断开——共识最佳实践
+// （v1/v2 的主动探测漏洞就是这么堵上的）。
+// 交付物是 sing-box 客户端 JSON（两个出站：SS detour 到
+// ShadowTLS），和 Naive 同款做法：ShadowTLS 没有标准 URL
+// 链接格式，拼出来的 shadowtls:// 只有个别客户端认。
+
+type ShadowTLSConfig struct {
+	Version    int    `json:"version"`     // 3，固定
+	Password   string `json:"password"`    // ShadowTLS 密码
+	Handshake  string `json:"handshake"`   // 握手站域名，默认 gateway.icloud.com
+	StrictMode bool   `json:"strict_mode"` // 固定 true
+	SSMethod   string `json:"ss_method"`   // 内层 SS 方法
+	SSPassword string `json:"ss_password"` // 内层 SS 密码
+	InnerPort  int    `json:"inner_port"`  // 内层 SS 回环端口（创建时分配）
+	Listen     string `json:"listen"`
+}
+
+func DefaultShadowTLS() ShadowTLSConfig {
+	return ShadowTLSConfig{
+		Version:    3,
+		Password:   randHex(16),
+		Handshake:  "gateway.icloud.com",
+		StrictMode: true,
+		SSMethod:   "2022-blake3-aes-128-gcm",
+		SSPassword: SSKey("2022-blake3-aes-128-gcm"),
+	}
+}
+
+// SingBoxShadowTLSInbound：公网 shadowtls 入站，detour 到同节点内层 SS。
+func SingBoxShadowTLSInbound(tag string, port int, cfg ShadowTLSConfig) map[string]interface{} {
+	handshake := cfg.Handshake
+	if handshake == "" {
+		handshake = "gateway.icloud.com"
+	}
+	return map[string]interface{}{
+		"type":        "shadowtls",
+		"tag":         tag,
+		"listen":      sbListen(cfg.Listen, "::"),
+		"listen_port": port,
+		"version":     3,
+		"users":       []interface{}{map[string]interface{}{"name": "user", "password": cfg.Password}},
+		"handshake":   map[string]interface{}{"server": handshake, "server_port": 443},
+		"strict_mode": true,
+		"detour":      tag + "-ss",
+	}
+}
+
+// SingBoxShadowTLSInnerSS：内层 SS 入站，只听回环，绝不对外。
+func SingBoxShadowTLSInnerSS(tag string, cfg ShadowTLSConfig) map[string]interface{} {
+	method := cfg.SSMethod
+	if method == "" {
+		method = "2022-blake3-aes-128-gcm"
+	}
+	return map[string]interface{}{
+		"type":        "shadowsocks",
+		"tag":         tag,
+		"listen":      "127.0.0.1",
+		"listen_port": cfg.InnerPort,
+		"method":      method,
+		"password":    cfg.SSPassword,
+	}
+}
+
+// ShadowTLSClientJSON：客户端 JSON（两个出站，SS detour 到 ShadowTLS）。
+// 出站 tag 用节点名 + 后缀：两个 ShadowTLS 节点拼进同一份客户端配置时
+// 也不会撞 tag。
+// 载体出站 tag 带 " §hide§"：Hiddify 的约定（hiddify-core
+// v2/hcore/proxy_info.go：tag 含 §hide§ 的代理不在代理列表显示），
+// 这样 Hiddify 里 ShadowTLS 只显示一个节点条目，载体不再单独占一行
+// （2026-11-12 PAPA 截图反馈）；sing-box 本身不认 §hide§，只当它是
+// tag 字符串，detour 按原样指过去，check 照过。
+func ShadowTLSClientJSON(address string, port int, cfg ShadowTLSConfig, name string) string {
+	method := cfg.SSMethod
+	if method == "" {
+		method = "2022-blake3-aes-128-gcm"
+	}
+	handshake := cfg.Handshake
+	if handshake == "" {
+		handshake = "gateway.icloud.com"
+	}
+	doc := map[string]interface{}{
+		"outbounds": []interface{}{
+			map[string]interface{}{
+				"type":        "shadowsocks",
+				"tag":         name,
+				"server":      address,
+				"server_port": port,
+				"method":      method,
+				"password":    cfg.SSPassword,
+				"detour":      name + "-shadowtls §hide§",
+			},
+			map[string]interface{}{
+				"type":        "shadowtls",
+				"tag":         name + "-shadowtls §hide§",
+				"server":      address,
+				"server_port": port,
+				"version":     3,
+				"password":    cfg.Password,
+				"tls":         map[string]interface{}{"enabled": true, "server_name": handshake},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(doc, "", "  ")
+	return string(b)
+}
+
 // ---------- TLS / 传输小件 ----------
 
 // sbListen：入站监听默认值一律双栈 "::"（Linux 默认 bindv6only=0 时
@@ -780,9 +994,9 @@ func SingBoxChainRules(chains []ChainInput) []map[string]interface{} {
 		// 生成无匹配条件的 catch-all，否则 A 的全部流量都会被送往 B。
 		if len(suffixes) > 0 {
 			rules = append(rules, map[string]interface{}{
-				"inbound":      []string{ch.InboundTag},
-				"action":       "route",
-				"outbound":     ch.OutboundTag,
+				"inbound":       []string{ch.InboundTag},
+				"action":        "route",
+				"outbound":      ch.OutboundTag,
 				"domain_suffix": suffixes,
 			})
 		}
@@ -924,6 +1138,9 @@ func SingBoxFullConfig(inbounds []interface{}, endpoints []interface{}, outbound
 // 自签证书所以 allow_insecure=1；拥塞算法与服务端一致写 bbr。
 func TUICLink(address string, port int, sni string, cfg TUICConfig, name string) string {
 	v := url.Values{}
+	// security=tls：TUIC 全程 TLS，官方方案无此参数，但部分客户端靠它
+	// 决定生成 TLS 块（与 Hy2Link 同理）。
+	v.Set("security", "tls")
 	v.Set("congestion_control", "bbr")
 	v.Set("udp_relay_mode", "native")
 	v.Set("alpn", "h3")
@@ -945,6 +1162,8 @@ func TUICLink(address string, port int, sni string, cfg TUICConfig, name string)
 // password，所以链接里只放密码（与 sing-box anytls 出站字段一致）。
 func AnyTLSLink(address string, port int, sni string, cfg AnyTLSConfig, name string) string {
 	v := url.Values{}
+	// security=tls：AnyTLS 全程 TLS，理由同 Hy2Link/TUICLink。
+	v.Set("security", "tls")
 	if sni != "" {
 		v.Set("sni", sni)
 	}

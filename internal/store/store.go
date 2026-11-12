@@ -257,10 +257,27 @@ func (s *Store) ListInbounds() ([]*Inbound, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) PortInUse(port int, excludeID string) bool {
-	var n int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM inbounds WHERE port=? AND id!=?", port, excludeID).Scan(&n)
-	return n > 0
+// UDPOnlyProtocol：只走 UDP 的协议。TCP 与 UDP 端口是两套独立编号，
+// 这类协议只跟同样走 UDP 的节点抢端口（2026-11-12：面板里 TCP 节点
+// 也会拦住同端口的 UDP 节点，同一类问题）。
+func UDPOnlyProtocol(protocol string) bool {
+	return protocol == "hy2" || protocol == "tuic" || protocol == "wireguard"
+}
+
+func (s *Store) PortInUse(port int, protocol string, excludeID string) bool {
+	// TCP 与 UDP 端口是两套编号：只拦同一种传输的节点。
+	rows, err := s.db.Query("SELECT protocol FROM inbounds WHERE port=? AND id!=?", port, excludeID)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil && UDPOnlyProtocol(p) == UDPOnlyProtocol(protocol) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- bnodes (saved outbound nodes for chaining) ----

@@ -157,12 +157,14 @@ func checkRealityDest(nodeName, dest string) error {
 	return nil
 }
 
-// checkPortConflicts：启用的同协议组入站之间，同端口 + 冲突监听
+// checkPortConflicts：启用的同传输入站之间，同端口 + 冲突监听
 // 必须在生成前拦住——否则 sing-box 起不来，整个 Apply 白白回滚。
 // 创建/编辑时已拦重复端口，这里防的是直接改库、克隆竞态等旁路。
+// TCP 与 UDP 端口是两套编号（2026-11-12）：不同传输的节点同端口
+// 不冲突，只拦同传输的。
 func checkPortConflicts(inbounds []*store.Inbound, group string) error {
 	type claim struct {
-		name, listen string
+		name, listen, protocol string
 	}
 	claims := map[int][]claim{}
 	for _, in := range inbounds {
@@ -173,11 +175,14 @@ func checkPortConflicts(inbounds []*store.Inbound, group string) error {
 			Listen string `json:"listen"`
 		}
 		_ = json.Unmarshal([]byte(in.Config), &raw)
-		claims[in.Port] = append(claims[in.Port], claim{in.Name, raw.Listen})
+		claims[in.Port] = append(claims[in.Port], claim{in.Name, raw.Listen, in.Protocol})
 	}
 	for port, cs := range claims {
 		for i := 0; i < len(cs); i++ {
 			for j := i + 1; j < len(cs); j++ {
+				if store.UDPOnlyProtocol(cs[i].protocol) != store.UDPOnlyProtocol(cs[j].protocol) {
+					continue
+				}
 				if listenConflict(cs[i].listen, cs[j].listen) {
 					return fmt.Errorf("%s节点 %s 与 %s 端口冲突：同占 %d", group, cs[i].name, cs[j].name, port)
 				}
@@ -395,6 +400,39 @@ func (a *App) ApplySingBox() error {
 				return fmt.Errorf("Naive 节点 %s 的私钥文件不存在：%s", in.Name, cfg.KeyFile)
 			}
 			sbInbounds = append(sbInbounds, proxy.SingBoxNaiveInbound("in-"+in.ID, in.Port, cfg, cfg.CertFile, cfg.KeyFile))
+		case "snell":
+			var cfg proxy.SnellConfig
+			if err := mustConfig(in, &cfg); err != nil {
+				return err
+			}
+			// 版本与 PSK 在创建/编辑时已归一化，这里按节点名再拦一次
+			// 非法值，免得脏数据让整站 Apply 冻结。
+			if cfg.Version != 5 && cfg.Version != 6 {
+				return fmt.Errorf("节点 %s：不支持的 Snell 版本 %d", in.Name, cfg.Version)
+			}
+			if cfg.PSK == "" {
+				return fmt.Errorf("节点 %s：Snell 缺少 PSK", in.Name)
+			}
+			if cfg.Version == 6 && (len(cfg.PSK) < 12 || len(cfg.PSK) > 255) {
+				return fmt.Errorf("节点 %s：Snell v6 的 PSK 必须是 12-255 字节", in.Name)
+			}
+			sbInbounds = append(sbInbounds, proxy.SingBoxSnellInbound("in-"+in.ID, in.Port, cfg))
+		case "shadowtls":
+			var cfg proxy.ShadowTLSConfig
+			if err := mustConfig(in, &cfg); err != nil {
+				return err
+			}
+			if cfg.Password == "" {
+				return fmt.Errorf("节点 %s：ShadowTLS 缺少密码", in.Name)
+			}
+			if cfg.Handshake == "" {
+				return fmt.Errorf("节点 %s：ShadowTLS 缺少握手站域名", in.Name)
+			}
+			if cfg.InnerPort < 1 || cfg.InnerPort > 65535 {
+				return fmt.Errorf("节点 %s：ShadowTLS 内层端口无效", in.Name)
+			}
+			sbInbounds = append(sbInbounds, proxy.SingBoxShadowTLSInbound("in-"+in.ID, in.Port, cfg))
+			sbInbounds = append(sbInbounds, proxy.SingBoxShadowTLSInnerSS("in-"+in.ID+"-ss", cfg))
 		case "wireguard":
 			var cfg proxy.WGConfig
 			if err := mustConfig(in, &cfg); err != nil {

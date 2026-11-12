@@ -139,11 +139,19 @@ func TestLinksIPv6Bracketed(t *testing.T) {
 		t.Fatalf("vless link missing brackets: %s", vless)
 	}
 	ss := SSLink(v6, 8388, SSConfig{Method: "2022-blake3-aes-128-gcm", Password: "pw"}, "n")
-	// SS 链接整体是 base64：解开看里面的 host:port 是否带方括号。
-	rawPart := strings.TrimPrefix(strings.SplitN(ss, "#", 2)[0], "ss://")
-	decoded, err := base64.RawURLEncoding.DecodeString(rawPart)
-	if err != nil || !strings.Contains(string(decoded), "@["+v6+"]:8388") {
-		t.Fatalf("ss link inner host:port missing brackets: %s (decoded %s)", ss, string(decoded))
+	// SIP002：userinfo 是 base64(方法:密码)，host:port 在 @ 外面、须带方括号。
+	noFrag := strings.SplitN(ss, "#", 2)[0]
+	rest := strings.TrimPrefix(noFrag, "ss://")
+	at := strings.LastIndex(rest, "@")
+	if at < 0 {
+		t.Fatalf("ss link missing @: %s", ss)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(rest[:at])
+	if err != nil || string(decoded) != "2022-blake3-aes-128-gcm:pw" {
+		t.Fatalf("ss link userinfo wrong: %s (decoded %s, err %v)", ss, string(decoded), err)
+	}
+	if rest[at+1:] != "["+v6+"]:8388" {
+		t.Fatalf("ss link host:port missing brackets: %s", ss)
 	}
 	wg := WGClientConfig(v6, 51820, WGConfig{ClientPriv: "cpriv", ClientIP: "10.0.0.2/32", ServerPub: "spub"}, "n")
 	if !strings.Contains(wg, "Endpoint = ["+v6+"]:51820") {

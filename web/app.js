@@ -371,6 +371,8 @@ function protoBadge(p){
   if (p === 'tuic') return '<span class="badge">TUIC</span>';
   if (p === 'anytls') return '<span class="badge">AnyTLS</span>';
   if (p === 'naive') return '<span class="badge">Naive</span>';
+  if (p === 'snell') return '<span class="badge">Snell</span>';
+  if (p === 'shadowtls') return '<span class="badge">ShadowTLS</span>';
   if (p === 'hysteria2') return '<span class="badge hy2">HY2</span>';
   return '<span class="badge">' + escHtml(p) + '</span>';
 }
@@ -419,6 +421,11 @@ function protoFull(p, cfg){
   if (p === 'tuic') return 'sing-box · TUIC + QUIC/UDP + TLS';
   if (p === 'anytls') return 'sing-box · AnyTLS + TCP + TLS';
   if (p === 'naive') return 'sing-box · Naive + TCP + TLS（需 CA 证书）';
+  if (p === 'snell'){
+    const ver = (cfg && cfg.version) || 5;
+    return ver === 6 ? 'sing-box · Snell v6 + TCP + 流量整形' : 'sing-box · Snell v5 + TCP + HTTP 混淆';
+  }
+  if (p === 'shadowtls') return 'sing-box · ShadowTLS v3 + SS2022 + TCP + 真 TLS 握手';
   if (p === 'hysteria2') return 'Hysteria2';
   return p || '';
 }
@@ -519,8 +526,8 @@ function showLink(id){
   if (!n) return;
   const link = n.link || '';
   const extra = n.tme_link ? `<div style="margin-top:12px"><label>t.me 链接</label><div class="input-row"><input id="lkTme" readonly value="${escHtml(n.tme_link)}"><button class="btn ghost small" onclick="copyText('lkTme')">复制</button></div></div>` : '';
-  const linkField = (n.protocol === 'wireguard' || n.protocol === 'naive')
-    ? `<label>${n.protocol === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
+  const linkField = (n.protocol === 'wireguard' || n.protocol === 'naive' || n.protocol === 'shadowtls')
+    ? `<label>${n.protocol === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : n.protocol === 'shadowtls' ? 'ShadowTLS 配置（sing-box 客户端 JSON，两个出站，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
     : `<label>节点链接</label><div class="input-row"><input id="lkMain" readonly value="${escHtml(link)}"><button class="btn ghost small" onclick="copyText('lkMain')">复制</button></div>`;
   const link6Field = !n.link6 ? '' : (n.protocol === 'wireguard'
     ? `<div style="margin-top:12px"><label>WireGuard 配置 IPv6</label><textarea id="lkMain6" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(n.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain6')">复制配置</button></div></div>`
@@ -624,6 +631,8 @@ function sniWord(p){
   return '伪装';
 }
 function sniHintEdit(p, mode){
+  if (p === 'snell') return 'Snell 不走 TLS，没有 SNI/伪装域名；抗识别靠 v5 的 HTTP 混淆或 v6 的流量整形。';
+  if (p === 'shadowtls') return 'ShadowTLS 没有 SNI 行：握手站域名在下方高级配置里改，握手直接转发给它（真证书、真页面）。';
   if (p === 'hy2') return 'Hy2 是 QUIC/UDP + 真 TLS：面板按这个域名生成自签证书，客户端握手时 SNI 就是它（链接里 insecure=1，证书不校验真伪）。不需要真实域名，也不需要把域名解析到服务器，留空会自动推荐一个。改 SNI 后证书要重建，旧链接失效。';
   if (p === 'tuic') return 'TUIC 是 QUIC/UDP + 真 TLS：面板按这个域名生成自签证书，客户端握手时 SNI 就是它（链接里 allow_insecure=1）。不需要真实域名，也不需要把域名解析到服务器，留空会自动推荐一个。改 SNI 后证书要重建，旧链接失效。';
   if (p === 'anytls') return 'AnyTLS 是 TCP + 真 TLS：面板按这个域名生成自签证书，客户端握手时 SNI 就是它（链接里 insecure=1）。不需要真实域名，也不需要把域名解析到服务器，留空会自动推荐一个。改 SNI 后证书要重建，旧链接失效。';
@@ -724,10 +733,25 @@ function openEditNodeModal(id){
       <div><label>密码</label><input id="eNPw" value="" placeholder="留空保持原值"></div>
       <div><label>监听地址</label><input id="eNListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details><div class="hint">证书在节点菜单“上传 CA 证书”里换；换域名后要重新上传对应证书。</div>`;
+  } else if (n.protocol === 'snell'){
+    adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
+      <div><label>版本</label><select id="eSnVersion"><option value="5" ${(cfg.version || 5) === 5 ? 'selected' : ''}>v5（默认）</option><option value="6" ${cfg.version === 6 ? 'selected' : ''}>v6</option></select></div>
+      <div><label>PSK</label><input id="eSnPsk" value="" placeholder="留空保持原值"></div>
+      <div><label>混淆（v5）</label><select id="eSnObfs"><option value="http" ${(cfg.obfs_mode || 'http') === 'http' ? 'selected' : ''}>http</option><option value="none" ${cfg.obfs_mode === 'none' ? 'selected' : ''}>none</option></select></div>
+      <div><label>混淆 Host（v5）</label><input id="eSnObfsHost" value="${escHtml(cfg.obfs_host || '')}" placeholder="默认 bing.com"></div>
+      <div><label>流量整形（v6）</label><select id="eSnMode">${['default','unshaped','unsafe-raw'].map(m => `<option value="${m}" ${(cfg.mode || 'default') === m ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
+      <div><label>监听地址</label><input id="eSnListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+    </div></details><div class="hint">切到 v6 时 PSK 必须是 12-255 字节，太短会报错；v5 的混淆只在 v5 生效。</div>`;
+  } else if (n.protocol === 'shadowtls'){
+    adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
+      <div><label>握手站域名</label><input id="eStHandshake" value="${escHtml(cfg.handshake || '')}" placeholder="默认 gateway.icloud.com"></div>
+      <div><label>密码</label><input id="eStPass" value="" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eStListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+    </div></details><div class="hint">内层 SS 的密码和回环端口由面板管理，编辑不改；strict 模式固定开启。</div>`;
   }
   // Trojan 不进 noSni：Reality 档的 SNI 就用上面这行改，CF 档的域名
   // 在下方传输方式里改（保存时 CF 档以域名为准，上面那行会被忽略）。
-  const noSni = ['vmess', 'ss', 'socks', 'http', 'wireguard', 'dokodemo'].includes(n.protocol);
+  const noSni = ['vmess', 'ss', 'socks', 'http', 'wireguard', 'dokodemo', 'snell', 'shadowtls'].includes(n.protocol);
   openModal(`<h4>编辑节点：${escHtml(n.name)}</h4>
     <div class="hint" style="margin:0 0 12px">${escHtml(protoFull(n.protocol, cfg))}</div>
     <div class="form-grid">
@@ -834,6 +858,20 @@ async function saveEditNode(id){
     if ($('eNPw').value.trim()) adv.password = $('eNPw').value.trim();
     if ($('eNListen').value.trim()) adv.listen = $('eNListen').value.trim();
     body.advanced = adv;
+  } else if (n && n.protocol === 'snell'){
+    const adv = { version: parseInt($('eSnVersion').value, 10) };
+    if ($('eSnPsk').value.trim()) adv.psk = $('eSnPsk').value.trim();
+    adv.obfs_mode = $('eSnObfs').value;
+    if ($('eSnObfsHost').value.trim()) adv.obfs_host = $('eSnObfsHost').value.trim();
+    adv.mode = $('eSnMode').value;
+    if ($('eSnListen').value.trim()) adv.listen = $('eSnListen').value.trim();
+    body.advanced = adv;
+  } else if (n && n.protocol === 'shadowtls'){
+    const adv = {};
+    if ($('eStHandshake').value.trim()) adv.handshake = $('eStHandshake').value.trim();
+    if ($('eStPass').value.trim()) adv.password = $('eStPass').value.trim();
+    if ($('eStListen').value.trim()) adv.listen = $('eStListen').value.trim();
+    body.advanced = adv;
   }
   const qMode = $('eQMode') ? $('eQMode').value : '';
   const qGB = $('eQGB') ? parseFloat($('eQGB').value) : NaN;
@@ -886,6 +924,8 @@ function addFormHTML(){
       <button data-proto="tuic" onclick="setProto('tuic')">TUIC</button>
       <button data-proto="anytls" onclick="setProto('anytls')">AnyTLS</button>
       <button data-proto="naive" onclick="setProto('naive')">Naive</button>
+      <button data-proto="snell" onclick="setProto('snell')">Snell</button>
+      <button data-proto="shadowtls" onclick="setProto('shadowtls')">ShadowTLS</button>
       <button data-proto="ss" onclick="setProto('ss')">SS</button>
       <button data-proto="socks" onclick="setProto('socks')">SOCKS</button>
       <button data-proto="http" onclick="setProto('http')">HTTP</button>
@@ -996,6 +1036,33 @@ function addFormHTML(){
     <div id="naiveOpts" style="display:none">
       <div class="hint" style="margin-top:12px">Naive 是 Chromium 真浏览器网络栈的代理，抗封锁最像正常浏览，但必须用真实域名 + CA 证书（自签不行）。建好节点后，在节点菜单里“上传 CA 证书”，上传后节点才能启动；链接交付的是参考客户端 JSON 配置，不是 URL。</div>
     </div>
+    <div id="snellOpts" style="display:none">
+      <div class="form-grid" style="margin-top:12px">
+        <div><label>版本</label><select id="snVersion" onchange="setProto('snell')">
+          <option value="5">v5（默认，稳定，客户端支持最广）</option>
+          <option value="6">v6（流量整形内置，还是 beta）</option>
+        </select></div>
+        <div><label>PSK（密码）</label><input id="snPsk" placeholder="留空自动生成"></div>
+        <div id="snObfsRow"><label>混淆</label><select id="snObfs" onchange="setProto('snell')">
+          <option value="http">http（默认，伪装成普通 HTTP）</option>
+          <option value="none">none（不混淆）</option>
+        </select></div>
+        <div id="snObfsHostRow"><label>混淆 Host</label><input id="snObfsHost" placeholder="默认 bing.com"></div>
+        <div id="snModeRow" style="display:none"><label>流量整形（v6）</label><select id="snMode">
+          <option value="default">default（加密 + 整形，默认）</option>
+          <option value="unshaped">unshaped（只加密，不整形）</option>
+          <option value="unsafe-raw">unsafe-raw（不加密，仅调试）</option>
+        </select></div>
+      </div>
+      <div class="hint">Snell 是 Surge 的轻量协议，走 TCP。v5 用 HTTP 混淆防特征识别；v6 把混淆换成 PSK 派生的流量整形，PSK 必须是 12-255 字节。UDP 中继 v3 以上自动支持，不用配。</div>
+    </div>
+    <div id="shadowtlsOpts" style="display:none">
+      <div class="form-grid" style="margin-top:12px">
+        <div><label>握手站域名</label><input id="stHandshake" placeholder="默认 gateway.icloud.com"></div>
+        <div><label>密码</label><input id="stPass" placeholder="留空自动生成"></div>
+      </div>
+      <div class="hint">ShadowTLS v3 + 内层 SS2022：握手直接转发给握手站（真证书、真页面，主动探测看到的是真站），strict 模式强制开；内层 SS 的密码和回环端口由面板自动配好，不对外暴露。交付的是 sing-box 客户端 JSON 配置（两个出站），不是 URL——ShadowTLS 没有标准分享链接格式。</div>
+    </div>
     <div id="wgOpts" style="display:none">
       <div class="hint" style="margin-top:12px">WireGuard 走 UDP：面板给每个节点生成两对密钥（服务端一对、客户端一对），客户端公钥直接写进服务端，建好就能用。创建成功后在节点行“链接”里复制完整配置，贴进官方 WireGuard 客户端（或扫二维码）。</div>
     </div>
@@ -1058,6 +1125,8 @@ function setProto(p){
   $('tuicOpts').style.display = p === 'tuic' ? '' : 'none';
   $('anytlsOpts').style.display = p === 'anytls' ? '' : 'none';
   $('naiveOpts').style.display = p === 'naive' ? '' : 'none';
+  $('snellOpts').style.display = p === 'snell' ? '' : 'none';
+  $('shadowtlsOpts').style.display = p === 'shadowtls' ? '' : 'none';
   $('wgOpts').style.display = p === 'wireguard' ? '' : 'none';
   $('ssOpts').style.display = p === 'ss' ? '' : 'none';
   $('socksOpts').style.display = p === 'socks' ? '' : 'none';
@@ -1089,6 +1158,15 @@ function setProto(p){
     $('tHint').style.display = trojanMode === 'cf' ? '' : 'none';
     $('tTlsHint').style.display = (trojanMode === 'h2' || trojanMode === 'httpupgrade') ? '' : 'none';
     $('protoStack').textContent = protoFull('trojan', { mode: trojanMode });
+  } else if (p === 'snell'){
+    const ver = $('snVersion').value;
+    const v6 = ver === '6';
+    $('snObfsRow').style.display = v6 ? 'none' : '';
+    $('snObfsHostRow').style.display = (v6 || $('snObfs').value !== 'http') ? 'none' : '';
+    $('snModeRow').style.display = v6 ? '' : 'none';
+    $('protoStack').textContent = protoFull('snell', { version: parseInt(ver, 10) });
+  } else if (p === 'shadowtls'){
+    $('protoStack').textContent = protoFull('shadowtls', null);
   } else {
     $('sniLabel').textContent = sniLabel(p);
     $('protoStack').textContent = protoFull(p, null);
@@ -1145,7 +1223,7 @@ async function createInbound(){
   $('createMsg').textContent = '';
   // 前端先拦一道：需要的内核没装，根本不发创建请求；
   // 后端还会再拦一道，没装核的节点一个都建不出来。
-  const needCore = { vless: 'sing-box', vmess: 'sing-box', ss: 'sing-box', socks: 'sing-box', http: 'sing-box', trojan: 'sing-box', wireguard: 'sing-box', hy2: 'sing-box', tuic: 'sing-box', anytls: 'sing-box', naive: 'sing-box' }[CUR_PROTO];
+  const needCore = { vless: 'sing-box', vmess: 'sing-box', ss: 'sing-box', socks: 'sing-box', http: 'sing-box', trojan: 'sing-box', wireguard: 'sing-box', hy2: 'sing-box', tuic: 'sing-box', anytls: 'sing-box', naive: 'sing-box', snell: 'sing-box', shadowtls: 'sing-box' }[CUR_PROTO];
   const coreRow = CORE_LIST.find(c => c.name === needCore);
   if (coreRow && !coreRow.installed){
     $('createMsg').className = 'msg err';
@@ -1200,6 +1278,21 @@ async function createInbound(){
     body.advanced = adv;
   } else if (CUR_PROTO === 'wireguard'){
     body.advanced = {};
+  } else if (CUR_PROTO === 'snell'){
+    const adv = { version: parseInt($('snVersion').value, 10) };
+    if ($('snPsk').value.trim()) adv.psk = $('snPsk').value.trim();
+    if (adv.version === 5){
+      adv.obfs_mode = $('snObfs').value;
+      if ($('snObfsHost').value.trim()) adv.obfs_host = $('snObfsHost').value.trim();
+    } else {
+      adv.mode = $('snMode').value;
+    }
+    body.advanced = adv;
+  } else if (CUR_PROTO === 'shadowtls'){
+    const adv = {};
+    if ($('stHandshake').value.trim()) adv.handshake = $('stHandshake').value.trim();
+    if ($('stPass').value.trim()) adv.password = $('stPass').value.trim();
+    body.advanced = adv;
   } else if (CUR_PROTO === 'tuic' || CUR_PROTO === 'anytls' || CUR_PROTO === 'naive'){
     body.advanced = {};
   } else if (CUR_PROTO === 'ss'){
@@ -1220,12 +1313,12 @@ async function createInbound(){
   try {
     const r = await api('/api/inbounds', 'POST', body);
     closeModal();
-    // WireGuard 没有 URL 链接、Naive 交付的是 JSON 配置，都用多行框展示。
-    const linkField = (CUR_PROTO === 'wireguard' || CUR_PROTO === 'naive')
-      ? `<label>${CUR_PROTO === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(r.link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
+    // WireGuard 没有 URL 链接、Naive 与 ShadowTLS 交付的是 JSON 配置，都用多行框展示。
+    const linkField = (CUR_PROTO === 'wireguard' || CUR_PROTO === 'naive' || CUR_PROTO === 'shadowtls')
+      ? `<label>${CUR_PROTO === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : CUR_PROTO === 'shadowtls' ? 'ShadowTLS 配置（sing-box 客户端 JSON，两个出站，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(r.link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
       : `<label>节点链接</label><div class="input-row"><input id="lkMain" readonly value="${escHtml(r.link)}"><button class="btn ghost small" onclick="copyText('lkMain')">复制</button></div>`;
-    const link6Field = !r.link6 ? '' : (CUR_PROTO === 'wireguard'
-      ? `<div style="margin-top:12px"><label>WireGuard 配置 IPv6</label><textarea id="lkMain6" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(r.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain6')">复制配置</button></div></div>`
+    const link6Field = !r.link6 ? '' : (CUR_PROTO === 'wireguard' || CUR_PROTO === 'shadowtls'
+      ? `<div style="margin-top:12px"><label>${CUR_PROTO === 'shadowtls' ? 'ShadowTLS 配置 IPv6' : 'WireGuard 配置 IPv6'}</label><textarea id="lkMain6" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(r.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain6')">复制配置</button></div></div>`
       : `<div style="margin-top:12px"><label>节点链接 IPv6</label><div class="input-row"><input id="lkMain6" readonly value="${escHtml(r.link6)}"><button class="btn ghost small" onclick="copyText('lkMain6')">复制</button></div></div>`);
     openModal(`<h4>节点已创建：${escHtml(r.inbound.name)}</h4>
       ${linkField}
@@ -1862,7 +1955,10 @@ async function openSubModal(){
     const locals = (NODES || []).map(n => `<div class="row"><input type="checkbox" class="sub-check" data-key="in:${n.id}" ${excluded.has('in:' + n.id) ? '' : 'checked'}><div class="grow"><div class="t">${escHtml(n.name)} ${protoBadge(n.protocol)}</div><div class="s">本地节点 · ${n.enabled ? '启用中' : '已停用（停用的节点订阅里也不会出）'}</div></div></div>`).join('');
     const others = (BNODES || []).map(b => `<div class="row"><input type="checkbox" class="sub-check" data-key="bn:${b.id}" ${excluded.has('bn:' + b.id) ? '' : 'checked'}><div class="grow"><div class="t">${escHtml(b.name)} ${protoBadge(b.protocol)}</div><div class="s">其他节点</div></div></div>`).join('');
     openModal(`<h4>订阅配置</h4>
-      <label>订阅链接</label><div class="input-row"><input id="subLink" readonly value="${escHtml(link)}"><button class="btn ghost small" onclick="copyText('subLink')">复制</button><button class="btn ghost small" onclick="regenSubFromModal()">换一个</button></div>
+      <label>订阅链接（链接列表，v2rayN / Shadowrocket / NekoBox）</label><div class="input-row"><input id="subLink" readonly value="${escHtml(link)}"><button class="btn ghost small" onclick="copyText('subLink')">复制</button><button class="btn ghost small" onclick="regenSubFromModal()">换一个</button></div>
+      <label>sing-box JSON（Hiddify / sing-box / Karing，全部协议）</label><div class="input-row"><input id="subLinkSingbox" readonly value="${escHtml(link + '?format=singbox')}"><button class="btn ghost small" onclick="copyText('subLinkSingbox')">复制</button></div>
+      <label>Clash YAML（mihomo / Clash Verge / Stash）</label><div class="input-row"><input id="subLinkClash" readonly value="${escHtml(link + '?format=clash')}"><button class="btn ghost small" onclick="copyText('subLinkClash')">复制</button></div>
+      <div class="hint">同一订阅链接会按客户端自动识别格式；上面是各客户端的专属链接。WireGuard 没有单行链接形式，只在 JSON 与 YAML 里；Snell v6 只在 JSON 里（mihomo 没有 v6）；ShadowTLS 不在链接列表里（链接里的插件形式在 Hiddify 与 mihomo 里都实测不通），sing-box/Hiddify 走 JSON，mihomo 走 YAML；v2rayN 用不了 ShadowTLS/Snell/AnyTLS/Naive。</div>
       <div class="hint">默认包含全部节点；取消勾选、点保存后，客户端刷新订阅就变了。</div>
       <div style="margin-top:14px"><label>订阅包含的节点（默认全选）</label>${locals || '<div class="muted">暂无本地节点</div>'}${others}</div>
       <div class="hint">要加其他服务器的节点，去入站列表的“其他节点”里添加，那里添加的默认就进订阅。</div>

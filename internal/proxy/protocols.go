@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strconv"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -198,9 +198,15 @@ func SSKey(method string) string {
 	}
 }
 
+// SIP002 形态：ss://base64(方法:密码)@host:port#name。
+// 整段 base64 的旧形态（ss://base64(方法:密码@host:port)）在 Hiddify/NekoBox
+// 等 sing-box 系链接解析器里不解码 userinfo 之外的部分：server 会变成整串
+// base64、端口回落 443、方法变 none，节点直接是死的（2026-11-12 HiddifyCli
+// 5.5.5 实测）。SIP002 是各家都认的标准形态，v2rayN/mihomo/Shadowrocket
+// 也都支持，改过来不亏。
 func SSLink(address string, port int, cfg SSConfig, name string) string {
-	raw := cfg.Method + ":" + cfg.Password + "@" + hostPort(address, port)
-	return "ss://" + base64.RawURLEncoding.EncodeToString([]byte(raw)) + "#" + url.QueryEscape(name)
+	userinfo := base64.RawURLEncoding.EncodeToString([]byte(cfg.Method + ":" + cfg.Password))
+	return "ss://" + userinfo + "@" + hostPort(address, port) + "#" + url.QueryEscape(name)
 }
 
 // ---------- SOCKS5 ----------

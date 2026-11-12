@@ -89,6 +89,9 @@ func TestCheckPortConflicts(t *testing.T) {
 		{"0.0.0.0 与指定地址冲突", []*store.Inbound{mk("a", "vless", 10001, "0.0.0.0", true), mk("b", "vless", 10001, "127.0.0.1", true)}, true},
 		{"不同指定地址不冲突", []*store.Inbound{mk("a", "vless", 10001, "127.0.0.1", true), mk("b", "vless", 10001, "127.0.0.2", true)}, false},
 		{"停用节点不占端口", []*store.Inbound{mk("a", "vless", 10001, "", true), mk("b", "vless", 10001, "", false)}, false},
+		{"TCP 与 UDP 同端口不冲突", []*store.Inbound{mk("a", "vless", 443, "", true), mk("b", "hy2", 443, "", true)}, false},
+		{"UDP 与 UDP 同端口冲突", []*store.Inbound{mk("a", "hy2", 443, "", true), mk("b", "tuic", 443, "", true)}, true},
+		{"TCP 与 UDP 同端口、指定监听也不冲突", []*store.Inbound{mk("a", "vless", 443, "127.0.0.1", true), mk("b", "wireguard", 443, "127.0.0.1", true)}, false},
 	}
 	for _, c := range cases {
 		err := checkPortConflicts(c.ins, "sing-box")

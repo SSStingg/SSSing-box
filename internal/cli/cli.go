@@ -546,7 +546,7 @@ func runNode(o options, args []string) int {
 		return 0
 	case "add":
 		fs := flag.NewFlagSet("add", flag.ContinueOnError)
-		protocol := fs.String("protocol", "", "协议：vless/hy2/vmess/ss/socks/http/trojan/wireguard/tuic/anytls/naive")
+		protocol := fs.String("protocol", "", "协议：vless/hy2/vmess/ss/socks/http/trojan/wireguard/tuic/anytls/naive/snell/shadowtls")
 		port := fs.Int("port", 0, "端口（0=自动分配）")
 		name := fs.String("name", "", "节点名（留空自动）")
 		sni := fs.String("sni", "", "SNI/域名（留空自动）")
@@ -555,6 +555,9 @@ func runNode(o options, args []string) int {
 		method := fs.String("method", "2022-blake3-aes-128-gcm", "SS 加密方式")
 		cert := fs.String("cert", "", "Naive 证书文件路径")
 		key := fs.String("key", "", "Naive 密钥文件路径")
+		version := fs.Int("version", 5, "Snell 版本（5 或 6，默认 5）")
+		obfs := fs.String("obfs", "http", "Snell v5 混淆（http 或 none）")
+		handshake := fs.String("handshake", "", "ShadowTLS 握手站域名（留空默认 gateway.icloud.com）")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
 		}
@@ -581,6 +584,12 @@ func runNode(o options, args []string) int {
 			adv = map[string]interface{}{"mode": *mode, "path": *path}
 		case "ss":
 			adv = map[string]interface{}{"method": *method}
+		case "snell":
+			adv = map[string]interface{}{"version": *version, "obfs_mode": *obfs}
+		case "shadowtls":
+			if *handshake != "" {
+				adv = map[string]interface{}{"handshake": *handshake}
+			}
 		}
 		c, err := newClient(o)
 		if err != nil {

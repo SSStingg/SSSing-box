@@ -3,9 +3,7 @@ package server
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1066,6 +1064,14 @@ func (s *Server) inboundLinks(in *store.Inbound) (link, tme string) {
 		var cfg proxy.NaiveConfig
 		_ = json.Unmarshal([]byte(in.Config), &cfg)
 		return proxy.NaiveLink(cfg, in.Port), ""
+	case "snell":
+		var cfg proxy.SnellConfig
+		_ = json.Unmarshal([]byte(in.Config), &cfg)
+		return proxy.SnellLink(addr, in.Port, cfg, in.Name), ""
+	case "shadowtls":
+		var cfg proxy.ShadowTLSConfig
+		_ = json.Unmarshal([]byte(in.Config), &cfg)
+		return proxy.ShadowTLSClientJSON(addr, in.Port, cfg, in.Name), ""
 	}
 	return "", ""
 }
@@ -1122,6 +1128,14 @@ func inboundListensV6(in *store.Inbound) bool {
 		listen = cfg.Listen
 	case "naive":
 		var cfg proxy.NaiveConfig
+		_ = json.Unmarshal([]byte(in.Config), &cfg)
+		listen = cfg.Listen
+	case "snell":
+		var cfg proxy.SnellConfig
+		_ = json.Unmarshal([]byte(in.Config), &cfg)
+		listen = cfg.Listen
+	case "shadowtls":
+		var cfg proxy.ShadowTLSConfig
 		_ = json.Unmarshal([]byte(in.Config), &cfg)
 		listen = cfg.Listen
 	default:
@@ -1196,6 +1210,14 @@ func (s *Server) inboundLinks6(in *store.Inbound) (link, tme string) {
 	case "naive":
 		// Naive 链接 host 是真实域名，不需要单独的 IPv6 链接。
 		return "", ""
+	case "snell":
+		var cfg proxy.SnellConfig
+		_ = json.Unmarshal([]byte(in.Config), &cfg)
+		return proxy.SnellLink(b, in.Port, cfg, name), ""
+	case "shadowtls":
+		var cfg proxy.ShadowTLSConfig
+		_ = json.Unmarshal([]byte(in.Config), &cfg)
+		return proxy.ShadowTLSClientJSON(b, in.Port, cfg, name), ""
 	}
 	return "", ""
 }
@@ -1347,9 +1369,12 @@ func (s *Server) suggestPort(protocol string, mode ...string) (int, string) {
 	udpUsed := sysinfo.BoundUDPPorts()
 	list, _ := s.app.Store.ListInbounds()
 	for _, in := range list {
-		tcpUsed[in.Port] = true
-		if in.Protocol == "hy2" || in.Protocol == "tuic" || in.Protocol == "wireguard" {
+		// TCP 与 UDP 端口分开编号：节点端口只记到自己那边的表里，
+		// 别让面板里的 UDP 节点拦住 TCP 建议（或反过来）。
+		if store.UDPOnlyProtocol(in.Protocol) {
 			udpUsed[in.Port] = true
+		} else {
+			tcpUsed[in.Port] = true
 		}
 		// 统计端口也要预留：HY2 的 StatsPort 只在进程跑着时才占
 		// 系统端口；节点停着时 ListeningTCPPorts 里没有它，
@@ -1362,6 +1387,14 @@ func (s *Server) suggestPort(protocol string, mode ...string) (int, string) {
 		if in.Protocol == "hy2" && json.Unmarshal([]byte(in.Config), &sp) == nil && sp.StatsPort > 0 {
 			tcpUsed[sp.StatsPort] = true
 		}
+		// ShadowTLS 内层 SS 的回环端口也要预留：suggestPort 若把它
+		// 建议出去，新节点一启用就和内层 SS 抢端口。
+		if in.Protocol == "shadowtls" {
+			var stc proxy.ShadowTLSConfig
+			if json.Unmarshal([]byte(in.Config), &stc) == nil && stc.InnerPort > 0 {
+				tcpUsed[stc.InnerPort] = true
+			}
+		}
 	}
 	// panel's own ports
 	if p := s.app.Store.GetSetting("panel_port"); p != "" {
@@ -1371,13 +1404,12 @@ func (s *Server) suggestPort(protocol string, mode ...string) (int, string) {
 	}
 	// sing-box 没有 xray 那种 API 端口，不再预留 10085；中转端口 18099 也随旧架构退役。
 	free := func(p int) bool {
-		if tcpUsed[p] {
-			return false
+		// TCP 与 UDP 端口分开编号（见 store.UDPOnlyProtocol）：UDP 协议只看
+		// UDP 有没有被占，TCP 协议只看 TCP，别拿另一边的占用误拦。
+		if store.UDPOnlyProtocol(protocol) {
+			return !udpUsed[p]
 		}
-		if (protocol == "hy2" || protocol == "tuic" || protocol == "wireguard") && udpUsed[p] {
-			return false
-		}
-		return true
+		return !tcpUsed[p]
 	}
 	// VMess/Trojan 的 CF 模式例外：源站端口必须是 CF 允许的代理端口，
 	// 否则 CF 根本不转发，节点就是死的。
@@ -1454,7 +1486,7 @@ func portOccupier(port int) string {
 // 所以创建和克隆时先拦，缺核就明说去装。
 func requiredCore(protocol string) string {
 	switch protocol {
-	case "vless", "vmess", "ss", "socks", "http", "trojan", "wireguard", "hy2", "tuic", "anytls", "naive":
+	case "vless", "vmess", "ss", "socks", "http", "trojan", "wireguard", "hy2", "tuic", "anytls", "naive", "snell", "shadowtls":
 		return "sing-box"
 	}
 	return ""
@@ -1554,9 +1586,72 @@ func (s *Server) normalizeTrojan(cfg *proxy.TrojanConfig, sni string, port int) 
 	return nil
 }
 
+// normalizeSnell：创建与编辑共用。Version 非 5/6 直接报错，
+// 不静默改回 5（用户意图与服务端脱节）；v6 的 PSK 必须
+// 12-255 字节，短了直接报错，不自动拉长（拉长等于换密码，
+// 旧链接悄悄失效）。
+func (s *Server) normalizeSnell(cfg *proxy.SnellConfig) error {
+	switch cfg.Version {
+	case 0:
+		cfg.Version = 5
+	case 5, 6:
+	default:
+		return fmt.Errorf("不支持的 Snell 版本：%d（只支持 5 / 6）", cfg.Version)
+	}
+	if cfg.PSK == "" {
+		return fmt.Errorf("Snell 必须设置 PSK")
+	}
+	if cfg.Version == 5 {
+		if cfg.ObfsMode == "" {
+			cfg.ObfsMode = "http"
+		}
+		if cfg.ObfsMode != "none" && cfg.ObfsMode != "http" {
+			return fmt.Errorf("不支持的 Snell 混淆模式：%s（只支持 none / http）", cfg.ObfsMode)
+		}
+		if cfg.ObfsMode == "http" && cfg.ObfsHost == "" {
+			cfg.ObfsHost = "bing.com"
+		}
+	} else {
+		if len(cfg.PSK) < 12 || len(cfg.PSK) > 255 {
+			return fmt.Errorf("Snell v6 的 PSK 必须是 12-255 字节，当前 %d 字节", len(cfg.PSK))
+		}
+		if cfg.Mode == "" {
+			cfg.Mode = "default"
+		}
+		if cfg.Mode != "default" && cfg.Mode != "unshaped" && cfg.Mode != "unsafe-raw" {
+			return fmt.Errorf("不支持的 Snell v6 模式：%s", cfg.Mode)
+		}
+	}
+	return nil
+}
+
+// normalizeShadowTLS：创建与编辑共用。版本只认 3；
+// strict_mode 强制 true（最佳预设，不开放关闭）；
+// 握手站必须是合法域名；内层 SS 缺失时按默认补齐。
+func (s *Server) normalizeShadowTLS(cfg *proxy.ShadowTLSConfig) error {
+	cfg.Version = 3
+	cfg.StrictMode = true
+	if cfg.Password == "" {
+		return fmt.Errorf("ShadowTLS 必须设置密码")
+	}
+	if cfg.Handshake == "" {
+		cfg.Handshake = "gateway.icloud.com"
+	}
+	if !validSNI(cfg.Handshake) {
+		return fmt.Errorf("ShadowTLS 握手站域名格式不对：%s", cfg.Handshake)
+	}
+	if cfg.SSMethod == "" {
+		cfg.SSMethod = "2022-blake3-aes-128-gcm"
+	}
+	if cfg.SSPassword == "" {
+		cfg.SSPassword = proxy.SSKey(cfg.SSMethod)
+	}
+	return nil
+}
+
 func (s *Server) createInbound(protocol string, port int, name, address, sni string, advanced map[string]interface{}) (*store.Inbound, error) {
 	switch protocol {
-	case "vless", "hy2", "vmess", "ss", "socks", "http", "trojan", "wireguard", "tuic", "anytls", "naive":
+	case "vless", "hy2", "vmess", "ss", "socks", "http", "trojan", "wireguard", "tuic", "anytls", "naive", "snell", "shadowtls":
 	default:
 		return nil, fmt.Errorf("不支持的协议：%s", protocol)
 	}
@@ -1576,11 +1671,11 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 	if port < 1 || port > 65535 {
 		return nil, fmt.Errorf("端口范围 1-65535")
 	}
-	if s.app.Store.PortInUse(port, "") {
+	if s.app.Store.PortInUse(port, protocol, "") {
 		return nil, fmt.Errorf("端口 %d 已被本面板其他节点占用", port)
 	}
 	tcpUsed := sysinfo.ListeningTCPPorts()
-	if tcpUsed[port] {
+	if !store.UDPOnlyProtocol(protocol) && tcpUsed[port] {
 		return nil, fmt.Errorf("端口 %d 已被系统其他程序占用", port)
 	}
 	if protocol == "hy2" && sysinfo.BoundUDPPorts()[port] {
@@ -1593,7 +1688,7 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 		return nil, fmt.Errorf("端口 %d 的 UDP 已被占用（WireGuard 走 UDP）", port)
 	}
 	if name == "" {
-		short := map[string]string{"vless": "VLESS", "hy2": "HY2", "vmess": "VMESS", "ss": "SS", "socks": "SOCKS", "http": "HTTP", "trojan": "TROJAN", "wireguard": "WG", "tuic": "TUIC", "anytls": "ANYTLS", "naive": "NAIVE"}[protocol]
+		short := map[string]string{"vless": "VLESS", "hy2": "HY2", "vmess": "VMESS", "ss": "SS", "socks": "SOCKS", "http": "HTTP", "trojan": "TROJAN", "wireguard": "WG", "tuic": "TUIC", "anytls": "ANYTLS", "naive": "NAIVE", "snell": "SNELL", "shadowtls": "SHADOWTLS"}[protocol]
 		name = fmt.Sprintf("%s-%d", short, port)
 	}
 	if address == "" {
@@ -1736,6 +1831,26 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 			return nil, fmt.Errorf("WireGuard 客户端 IP 不是合法 CIDR：%s", cfg.ClientIP)
 		}
 		in.Config = store.MustJSON(cfg)
+	case "snell":
+		cfg := proxy.DefaultSnell()
+		mergeAdvanced(&cfg, advanced)
+		if err := s.normalizeSnell(&cfg); err != nil {
+			return nil, err
+		}
+		in.Config = store.MustJSON(cfg)
+	case "shadowtls":
+		cfg := proxy.DefaultShadowTLS()
+		mergeAdvanced(&cfg, advanced)
+		if err := s.normalizeShadowTLS(&cfg); err != nil {
+			return nil, err
+		}
+		if cfg.InnerPort == 0 {
+			cfg.InnerPort = s.allocInnerPort()
+			if cfg.InnerPort == 0 {
+				return nil, fmt.Errorf("没有可用的内层端口（20000-20999 都被占用了）")
+			}
+		}
+		in.Config = store.MustJSON(cfg)
 	}
 	if protocol == "naive" {
 		// 没证书的节点先停用：上传证书时自动启用，避免一创建就启动失败。
@@ -1796,6 +1911,40 @@ func (s *Server) allocStatsPort() int {
 		}
 	}
 	for p := 19000; p < 20000; p++ {
+		if !used[p] {
+			return p
+		}
+	}
+	return 0
+}
+
+// allocInnerPort：给 ShadowTLS 内层 SS 分一个回环端口（20000-20999）。
+// 内层端口绝不能和节点端口、HY2 统计端口撞上，也不能被
+// suggestPort 再建议出去（见 suggestPort 里的预留）。
+func (s *Server) allocInnerPort() int {
+	used := map[int]bool{}
+	for p := range sysinfo.ListeningTCPPorts() {
+		used[p] = true
+	}
+	inbounds, _ := s.app.Store.ListInbounds()
+	for _, in := range inbounds {
+		used[in.Port] = true
+		switch in.Protocol {
+		case "hy2":
+			var cfg proxy.Hy2Config
+			_ = json.Unmarshal([]byte(in.Config), &cfg)
+			if cfg.StatsPort > 0 {
+				used[cfg.StatsPort] = true
+			}
+		case "shadowtls":
+			var cfg proxy.ShadowTLSConfig
+			_ = json.Unmarshal([]byte(in.Config), &cfg)
+			if cfg.InnerPort > 0 {
+				used[cfg.InnerPort] = true
+			}
+		}
+	}
+	for p := 20000; p < 21000; p++ {
 		if !used[p] {
 			return p
 		}
@@ -1890,11 +2039,11 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					errJSON(w, 400, "端口范围 1-65535")
 					return
 				}
-				if s.app.Store.PortInUse(*body.Port, in.ID) {
+				if s.app.Store.PortInUse(*body.Port, in.Protocol, in.ID) {
 					errJSON(w, 400, fmt.Sprintf("端口 %d 已被本面板其他节点占用", *body.Port))
 					return
 				}
-				if sysinfo.ListeningTCPPorts()[*body.Port] {
+				if !store.UDPOnlyProtocol(in.Protocol) && sysinfo.ListeningTCPPorts()[*body.Port] {
 					errJSON(w, 400, fmt.Sprintf("端口 %d 已被系统其他程序占用", *body.Port))
 					return
 				}
@@ -2056,6 +2205,33 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					var cfg proxy.NaiveConfig
 					_ = json.Unmarshal([]byte(in.Config), &cfg)
 					mergeAdvanced(&cfg, body.Advanced)
+					in.Config = store.MustJSON(cfg)
+				case "snell":
+					var cfg proxy.SnellConfig
+					_ = json.Unmarshal([]byte(in.Config), &cfg)
+					mergeAdvanced(&cfg, body.Advanced)
+					if err := s.normalizeSnell(&cfg); err != nil {
+						errJSON(w, 400, err.Error())
+						return
+					}
+					in.Config = store.MustJSON(cfg)
+				case "shadowtls":
+					var cfg proxy.ShadowTLSConfig
+					_ = json.Unmarshal([]byte(in.Config), &cfg)
+					mergeAdvanced(&cfg, body.Advanced)
+					if err := s.normalizeShadowTLS(&cfg); err != nil {
+						errJSON(w, 400, err.Error())
+						return
+					}
+					// 内层端口只在创建时分配：编辑绝不能把它清零，
+					// 否则 Apply 时内层 SS 没端口可听。
+					if cfg.InnerPort == 0 {
+						cfg.InnerPort = s.allocInnerPort()
+						if cfg.InnerPort == 0 {
+							errJSON(w, 400, "没有可用的内层端口（20000-20999 都被占用了）")
+							return
+						}
+					}
 					in.Config = store.MustJSON(cfg)
 				case "wireguard":
 					var cfg proxy.WGConfig
@@ -2289,6 +2465,22 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					os.Remove(newKey)
 					cfg.CertFile, cfg.KeyFile = "", ""
 				}
+			}
+			clone.Config = store.MustJSON(cfg)
+		case "snell":
+			var cfg proxy.SnellConfig
+			_ = json.Unmarshal([]byte(in.Config), &cfg)
+			cfg.PSK = proxy.DefaultSnell().PSK
+			clone.Config = store.MustJSON(cfg)
+		case "shadowtls":
+			var cfg proxy.ShadowTLSConfig
+			_ = json.Unmarshal([]byte(in.Config), &cfg)
+			fresh := proxy.DefaultShadowTLS()
+			cfg.Password, cfg.SSPassword = fresh.Password, fresh.SSPassword
+			cfg.InnerPort = s.allocInnerPort()
+			if cfg.InnerPort == 0 {
+				errJSON(w, 400, "没有可用的内层端口（20000-20999 都被占用了）")
+				return
 			}
 			clone.Config = store.MustJSON(cfg)
 		default:
@@ -3531,100 +3723,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------- subscription ----------
-
-func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
-	tok := strings.TrimPrefix(r.URL.Path, "/sub/")
-	// token 必须是路径剩余部分的全部：以前 SplitN 取首段，
-	// /sub/<真 token>/任意后缀 也能放行，白白放宽了口子。
-	if tok == "" || strings.Contains(tok, "/") {
-		http.NotFound(w, r)
-		return
-	}
-	want := s.app.Store.GetSetting("sub_token")
-	// 定长比较：普通 == 会在首个不同字节处提前返回，计时
-	// 侧信道能逐字节磨出 token；长度不同直接判否。
-	if len(tok) != len(want) || subtle.ConstantTimeCompare([]byte(tok), []byte(want)) != 1 {
-		http.NotFound(w, r)
-		return
-	}
-	// 订阅勾选：默认全包含；用户在订阅弹窗里取消勾选的，
-	// 记在 sub_excluded 里（"in:<id>" / "bn:<id>"），新节点
-	// 默认仍是包含的，不用每次手动再勾。
-	excluded := map[string]bool{}
-	var exList []string
-	if raw := s.app.Store.GetSetting("sub_excluded"); raw != "" {
-		_ = json.Unmarshal([]byte(raw), &exList)
-	}
-	for _, k := range exList {
-		excluded[k] = true
-	}
-	list, _ := s.app.Store.ListInbounds()
-	// 链式入口在订阅里另起一行（链名）：A 节点名（VLESS-A-V 这类自动名）
-	// 分不清，链名才是用户给链式起的名字；A 本身仍保留原样一行，
-	// 不是被链名替换掉。只对启用的链生效，停用的链不产生链行。
-	chainNames := map[string]string{}
-	if cl, _ := s.app.Store.ListChains(); cl != nil {
-		for _, c := range cl {
-			if c.Enabled && c.Name != "" {
-				chainNames[c.InboundID] = c.Name
-			}
-		}
-	}
-	var links []string
-	for _, in := range list {
-		if !in.Enabled {
-			continue
-		}
-		if excluded["in:"+in.ID] {
-			continue
-		}
-		// 本地节点原样进订阅。
-		link, _ := s.inboundLinks(in)
-		if link != "" {
-			links = append(links, link)
-		}
-		// 双栈节点同时发 IPv6 链接（link6 内部已按监听过滤，只给真双栈
-		// 节点发），让订阅用户拿到 v4/v6 两行，按需选用；以前订阅完全
-		// 没有 v6 行。
-		if link6, _ := s.inboundLinks6(in); link6 != "" {
-			links = append(links, link6)
-		}
-		// 链式入口另起一行（链名）：以前这里直接把 A 节点改名成链名，
-		// 订阅里就只剩链式、丢了 A 节点本身；现在 A 原样 + 链名各一行，
-		// 取消勾选 A 时两行一起去掉（链跟随 A）。停用的链不产生链行，
-		// 入口就是普通节点。链式入口的 v6 行名字是链名 + -ipv6。
-		if cn, ok := chainNames[in.ID]; ok {
-			cp := *in
-			cp.Name = cn
-			if clink, _ := s.inboundLinks(&cp); clink != "" {
-				links = append(links, clink)
-			}
-			if clink6, _ := s.inboundLinks6(&cp); clink6 != "" {
-				links = append(links, clink6)
-			}
-		}
-	}
-	// 其他节点（手动添加的其他服务器节点）也一并进订阅，统一管理；
-	// 但回环/内网地址的 B 链接对订阅客户端是死链（典型就是从本面板
-	// 节点原样粘过来的 127.0.0.1 链接），还会重复暴露一份凭证，直接
-	// 跳过；指到公网的 B 链接保留（行为测试 5.3）。
-	bnodes, _ := s.app.Store.ListBNodes()
-	for _, b := range bnodes {
-		if excluded["bn:"+b.ID] {
-			continue
-		}
-		if b.Link != "" {
-			if host, _, err := proxy.BNodeHostPort(b.Link); err == nil {
-				if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()) {
-					continue
-				}
-			}
-			links = append(links, b.Link)
-		}
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte(base64.StdEncoding.EncodeToString([]byte(strings.Join(links, "\n")))))
-}
 
 // ---------- background loops ----------
 

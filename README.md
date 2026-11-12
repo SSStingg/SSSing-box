@@ -1,6 +1,6 @@
 # SSSing-box
 
-单页面代理面板：一个页面管全部节点，基于 sing-box 内核，支持 11 种协议。
+单页面代理面板：一个页面管全部节点，基于 sing-box 内核，支持 13 种协议。
 
 **预设最佳配置，一键安装，一键配置，极简。** 节点默认就是最优档位（VLESS + Reality + TCP + xtls-rprx-vision 等），不用一个个参数调；装完就能用，不用再配。
 
@@ -19,7 +19,9 @@ curl -fsSL https://raw.githubusercontent.com/SSStingg/SSSing-box/main/install.sh
 
 ## 支持的协议
 
-VLESS、Hysteria2、VMess、Shadowsocks、SOCKS5、HTTP、Trojan、WireGuard、TUIC、AnyTLS、Naive（含 Reality / WS / H2 / HTTPUpgrade / CF 等搭建方式）。
+VLESS、Hysteria2、VMess、Shadowsocks、SOCKS5、HTTP、Trojan、WireGuard、TUIC、AnyTLS、Naive、Snell、ShadowTLS（含 Reality / WS / H2 / HTTPUpgrade / CF 等搭建方式）。
+
+订阅分三种格式：默认链接列表，`?format=singbox` 给 Hiddify / sing-box / Karing 的 JSON，`?format=clash` 给 mihomo 的 YAML；ShadowTLS 只在 JSON 与 YAML 里，WireGuard 没有单行链接。
 
 ## SSH 菜单
 
