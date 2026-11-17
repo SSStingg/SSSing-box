@@ -134,3 +134,27 @@ func TestLoginBrokenHash(t *testing.T) {
 		t.Fatal("正常账号应能登录")
 	}
 }
+
+// v1.0.2 安全修复：不存在的用户凭固定占位口令可获得管理会话。
+// dummyHash 以前是用源码里写死的固定明文算的 bcrypt 哈希，拿同一个明文
+// 去比对必然通过；现在改成启动时随机数，任何固定口令都比对不上；
+// 再加一道闸：未知用户即使比对通过也不发会话。
+func TestLoginUnknownUserDummyHash(t *testing.T) {
+	s := newAuthTestServer(t, "u1", "oldpass123")
+	// 不存在的用户 + 任意口令都应 401，且不下发会话 cookie。
+	for _, pw := range []string{"wrongpass", "admin", "123456", "password"} {
+		rec := postJSON(t, s, s.handleLogin, "/api/login", `{"username":"ghost","password":"`+pw+`"}`, nil)
+		if rec.Code != 401 {
+			t.Fatalf("不存在的用户用口令 %q 登录应 401，得到 %d", pw, rec.Code)
+		}
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "sssingbox_session" && c.Value != "" {
+				t.Fatalf("不存在的用户用口令 %q 登录不应下发会话 cookie", pw)
+			}
+		}
+	}
+	// 对照组：真实用户正常登录仍应成功。
+	if !loginOK(t, s, `{"username":"u1","password":"oldpass123"}`) {
+		t.Fatal("真实用户应能正常登录")
+	}
+}

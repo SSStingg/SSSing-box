@@ -130,10 +130,17 @@ func isBcryptHash(h string) bool {
 }
 
 // dummyHash：未知用户登录时也跑一次 bcrypt（时序对齐用）。值是启动时
-// 现算的一条合法 bcrypt 哈希，永远比对不上，只用来把响应时间拉平，
-// 让攻击者无法从快慢分辨账号存不存在。
+// 用 crypto/rand 现抽的随机数算出的一条 bcrypt 哈希，明文无人知晓，
+// 永远比对不上，只用来把响应时间拉平，让攻击者无法从快慢分辨账号存不存在。
+// 注意：绝不能用固定明文算这条哈希——固定明文写在公开源码里，攻击者
+// 拿它当口令就能直接通过比对（v1.0.2 安全修复：不存在的用户凭固定占位
+// 口令可获得管理会话）。
 var dummyHash = func() string {
-	h, _ := bcrypt.GenerateFromPassword([]byte("sssingbox-dummy-never-matches"), bcrypt.DefaultCost)
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	h, _ := bcrypt.GenerateFromPassword(b, bcrypt.DefaultCost)
 	return string(h)
 }()
 
@@ -495,6 +502,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)) != nil {
+		s.loginFailed(clientIPOf(r))
+		errJSON(w, 401, "账号或密码不对")
+		return
+	}
+	// 纵深防御：未知用户即使比对通过也不发会话。dummyHash 是随机数，
+	// 正常情况下不可能通过；这里是万一哈希逻辑被改坏时的最后一道闸。
+	// 注意顺序：bcrypt 必须先跑完再判，不能跳过比对直接 401，否则
+	// 未知用户的响应时间明显短于已知用户，时序上能枚举账号。
+	if err != nil {
 		s.loginFailed(clientIPOf(r))
 		errJSON(w, 401, "账号或密码不对")
 		return
