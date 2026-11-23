@@ -52,10 +52,21 @@ func EnsureWSCert(dir, prefix, id, domain string) (string, string, error) {
 	if b, err := os.ReadFile(certFile); err == nil {
 		if block, _ := pem.Decode(b); block != nil {
 			if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-				ok := cert.Subject.CommonName == domain || len(cert.DNSNames) == 0
-				for _, n := range cert.DNSNames {
-					if n == domain {
-						ok = true
+				ok := false
+				if ip := net.ParseIP(domain); ip != nil {
+					for _, cip := range cert.IPAddresses {
+						if cip.Equal(ip) {
+							ok = true
+							break
+						}
+					}
+				} else {
+					ok = cert.Subject.CommonName == domain
+					for _, n := range cert.DNSNames {
+						if n == domain {
+							ok = true
+							break
+						}
 					}
 				}
 				// 续期窗口 7 天：快到期的证书也别复用，否则
@@ -206,7 +217,7 @@ func SSKey(method string) string {
 // 也都支持，改过来不亏。
 func SSLink(address string, port int, cfg SSConfig, name string) string {
 	userinfo := base64.RawURLEncoding.EncodeToString([]byte(cfg.Method + ":" + cfg.Password))
-	return "ss://" + userinfo + "@" + hostPort(address, port) + "#" + url.QueryEscape(name)
+	return "ss://" + userinfo + "@" + hostPort(address, port) + "#" + url.PathEscape(name)
 }
 
 // ---------- SOCKS5 ----------
@@ -369,6 +380,7 @@ func WGClientConfig(address string, port int, cfg WGConfig, name string) string 
 # %s
 PrivateKey = %s
 Address = %s
+MTU = 1280
 DNS = 1.1.1.1
 
 [Peer]

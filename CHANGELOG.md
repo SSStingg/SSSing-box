@@ -1,5 +1,17 @@
 # 版本记录
 
+## 1.0.3（2026-11-23）
+
+- 链式分流：单 A 多 B 分流（B1/B2/B3 + 可选兜底 B）、全局直通、A 节点切换；订阅三种格式均带链名。
+- 链式静默降级全部改成报错：分流组引用的 B 节点不存在、兜底 B 节点不存在、全局直通的 B 节点不存在、入口 A 节点不存在时，应用配置直接失败并报明原因（旧配置继续跑），不再静默关链、跳组或改走直连；损坏的分流配置不再吞掉，ListChains 读到损坏的 routes JSON 时返回错误。
+- Snell 可做 B 节点：ParseBLink 支持面板自己的 snell:// 链接（version=4 认作 v5，version=6 认作 v6；v5 的 HTTP 混淆进 obfs_mode/obfs_host）；sing-box 出站不认 version 5 与 obfs 字段，面板 v5 写线路版 4、v6 写 6。
+- ShadowTLS 可做 B 节点：面板自定 shadowtls:// 链接格式（version/handshake/ss-method 省略时默认 3/gateway.icloud.com/2022-blake3-aes-128-gcm；内层 SS 密码必填）；SingBoxBOutbound 生成 SS 出站 + shadowtls detour 出站两个；本机 ShadowTLS 入站的分享链接改成单行 shadowtls://（可直接粘贴到另一台面板做 B 节点）；B 节点导入框支持 shadowtls://（9 种协议）；坏链接在解析或转换时即报错。
+- Carbon 审查 21 项修复：面板双监听器改成异步首包探测；写锁不再包住全部列表接口；内核安装的流量统计器改用已加锁的 Reset；流量统计按“协议:端口”分键（SS 计 TCP+UDP 双份；Snell 归 TCP——实测其监听与数据面都是 TCP）；删 B 节点回归修复（分流链只剩最后一组且有兜底 B 时退化成 direct 走兜底）；Clash 订阅补外部 B 节点；ACME 按 RFC 8555 修；Clash“自动选择”分组不再是孤儿；sing-box 订阅 HY2 补 server_ports；自签证书域名/IP 变化时重签；安装脚本 .cli-credentials 写前转义 + umask、卸载清全部 sssingbox-* nft 表；前端 B 节点支持 snell://、登出后停掉延迟轮询、HY2 限速留空可清零；流量重置清全部当日记录。
+- 测试中发现的两处追加修复：HY2 跳端口 nft 脚本 output 链的 priority dstnat 在 nft 里非法，改数字 -100；应用失败回滚后重应用一次（回滚后立即重应用把内核同步回库的状态）。
+- Carbon 审查 6 项修复：SS 端口冲突补 UDP（新增 ProtocolsShareTransport，按传输层交集判断）；首次初始化跳转（doSetup 拿到 panel_path 后跳到新路径）；PublicIP/PublicIPv6 加锁；流量限额自动停用加锁（checkQuota 拆分，PUT 不死锁）；前端 ShadowTLS 展示同步（多行判断只剩 wireguard 与 naive）；首次登录加载顺序（refreshAll 先加载证书再渲染）。
+- 4 处默认参数优化（只影响新建节点/新签证书）：WireGuard MTU 1420→1280（IPv6 最小 MTU，全网零分片；MTU 是渲染时常量，所有 WG 节点下次应用后都是 1280）；Snell v5 混淆 Host 不再默认 bing.com，改为 SNI 池随机取（bing.com / www.bing.com 永不入选）；ShadowTLS 握手站默认仍为 gateway.icloud.com，面板表单与 CLI 菜单各加随机推荐（/api/sni-random 支持多个 exclude 参数）；自签证书 RSA 2048→ECDSA P-256（老 RSA 证书仍复用，不重签）。
+- README 订阅说明同步：ShadowTLS 也有单行 shadowtls:// 链接，WireGuard 仅在 Sing-box JSON 与 Clash YAML 中下发。
+
 ## 1.0.2
 
 - 安全修复（严重）：不存在的用户凭固定占位口令可获得管理会话。`dummyHash` 以前是用源码里写死的固定明文算的 bcrypt 哈希，拿同一个明文去比对必然通过；现改成启动时用 `crypto/rand` 现抽 32 字节随机数算哈希，明文无人知晓，永远比对不上。另加纵深防御：登录里 bcrypt 比对通过后，若该用户不存在仍返回 401、不发会话（bcrypt 必须先跑完再判，避免时序上枚举账号）。新增回归测试 `TestLoginUnknownUserDummyHash`。

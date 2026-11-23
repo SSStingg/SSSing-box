@@ -209,6 +209,7 @@ func (s *Supervisor) startLocked(r *Runner) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		lf.Close()
+		r.logFile = nil
 		return err
 	}
 	r.cmd = cmd
@@ -308,6 +309,9 @@ func (s *Supervisor) Restart(name string, args []string) error {
 
 // RestartWithDir is Restart with a working directory for the process.
 func (s *Supervisor) RestartWithDir(name string, args []string, dir string) error {
+	if !validRunnerName(name) {
+		return fmt.Errorf("核心 %s 已退役或名字非法，拒绝重启", name)
+	}
 	r := s.get(name)
 	r.mu.Lock()
 	defer r.mu.Unlock()

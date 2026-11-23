@@ -212,6 +212,12 @@ func (e *acmeError) Error() string {
 // post：发 JWS 请求；遇 badNonce 自动换 nonce 重试一次。
 // payload=nil 表示 POST-as-GET。
 func (c *acmeClient) post(url string, payload any, useKid bool) (body []byte, hdr http.Header, status int, err error) {
+	return c.postWithAccept(url, payload, useKid, "")
+}
+
+// postWithAccept：post 的底层实现，可指定 Accept 头（证书链下载用
+// application/pem-certificate-chain），同样带 badNonce 重试。
+func (c *acmeClient) postWithAccept(url string, payload any, useKid bool, accept string) (body []byte, hdr http.Header, status int, err error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		jb, err := c.jwsBody(url, payload, useKid)
 		if err != nil {
@@ -219,6 +225,9 @@ func (c *acmeClient) post(url string, payload any, useKid bool) (body []byte, hd
 		}
 		req, _ := http.NewRequest("POST", url, bytes.NewReader(jb))
 		req.Header.Set("Content-Type", "application/jose+json")
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			return nil, nil, 0, err
@@ -331,10 +340,11 @@ func (c *acmeClient) orderCert(domains []string, method, cfToken string, h http0
 	for _, d := range domains {
 		idents = append(idents, map[string]string{"type": "dns", "value": d})
 	}
-	ob, _, _, err := c.post(c.dir.NewOrder, map[string]any{"identifiers": idents}, true)
+	ob, orderHdr, _, err := c.post(c.dir.NewOrder, map[string]any{"identifiers": idents}, true)
 	if err != nil {
 		return nil, nil, err
 	}
+	orderURL := orderHdr.Get("Location")
 	var order acmeOrder
 	if err := json.Unmarshal(ob, &order); err != nil {
 		return nil, nil, err
@@ -358,6 +368,9 @@ func (c *acmeClient) orderCert(domains []string, method, cfToken string, h http0
 		var authz acmeAuthz
 		if err := json.Unmarshal(ab, &authz); err != nil {
 			return nil, nil, err
+		}
+		if authz.Status == "valid" {
+			continue
 		}
 		var challURL, token string
 		for _, ch := range authz.Challenges {
@@ -441,7 +454,11 @@ func (c *acmeClient) orderCert(domains []string, method, cfToken string, h http0
 	}
 	certURL := fin.Certificate
 	if certURL == "" {
-		if err := c.pollUntil(order.Finalize, func(b []byte) (bool, error) {
+		pollTarget := orderURL
+		if pollTarget == "" {
+			pollTarget = order.Finalize
+		}
+		if err := c.pollUntil(pollTarget, func(b []byte) (bool, error) {
 			var o acmeOrder
 			if err := json.Unmarshal(b, &o); err != nil {
 				return false, err
@@ -458,22 +475,10 @@ func (c *acmeClient) orderCert(domains []string, method, cfToken string, h http0
 			return nil, nil, err
 		}
 	}
-	// 下载证书链（PEM）。
-	jw, err := c.jwsBody(certURL, nil, true)
+	// 下载证书链（PEM），走统一的 badNonce 重试。
+	chain, _, _, err := c.postWithAccept(certURL, nil, true, "application/pem-certificate-chain")
 	if err != nil {
-		return nil, nil, err
-	}
-	req, _ := http.NewRequest("POST", certURL, bytes.NewReader(jw))
-	req.Header.Set("Content-Type", "application/jose+json")
-	req.Header.Set("Accept", "application/pem-certificate-chain")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	chain, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, nil, fmt.Errorf("证书下载失败: %s", resp.Status)
+		return nil, nil, fmt.Errorf("证书下载失败: %w", err)
 	}
 	keyDER, err := x509.MarshalECPrivateKey(domKey)
 	if err != nil {

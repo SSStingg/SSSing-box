@@ -161,17 +161,19 @@ func TestLinksIPv6Bracketed(t *testing.T) {
 
 func TestBOutboundNormalizationAndValidation(t *testing.T) {
 	// hy2/ss 入站口径也要能转。
-	ob, err := SingBoxBOutbound("hy2", `{"type":"hysteria2","server":"1.2.3.4","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"example.com"}}`, "chain-t")
+	obs, err := SingBoxBOutbound("hy2", `{"type":"hysteria2","server":"1.2.3.4","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"example.com"}}`, "chain-t")
 	if err != nil {
 		t.Fatalf("hy2 normalize: %v", err)
 	}
+	ob := obs[0]
 	if ob["type"] != "hysteria2" {
 		t.Fatalf("hy2 type: %v", ob["type"])
 	}
-	ob, err = SingBoxBOutbound("ss", `{"protocol":"shadowsocks","settings":{"servers":[{"address":"1.2.3.4","port":8388,"method":"aes-128-gcm","password":"pw"}]}}`, "chain-t")
+	obs, err = SingBoxBOutbound("ss", `{"protocol":"shadowsocks","settings":{"servers":[{"address":"1.2.3.4","port":8388,"method":"aes-128-gcm","password":"pw"}]}}`, "chain-t")
 	if err != nil {
 		t.Fatalf("ss normalize: %v", err)
 	}
+	ob = obs[0]
 	if ob["type"] != "shadowsocks" {
 		t.Fatalf("ss type: %v", ob["type"])
 	}
@@ -188,10 +190,11 @@ func TestBOutboundNormalizationAndValidation(t *testing.T) {
 		t.Fatalf("parse https: %v", err)
 	}
 	b, _ := jsonMarshal(parsed.Outbound)
-	ob, err = SingBoxBOutbound("http", string(b), "chain-t")
+	obs, err = SingBoxBOutbound("http", string(b), "chain-t")
 	if err != nil {
 		t.Fatalf("https convert: %v", err)
 	}
+	ob = obs[0]
 	if _, ok := ob["tls"]; !ok {
 		t.Fatalf("https outbound lost tls: %v", ob)
 	}
@@ -208,10 +211,15 @@ func TestParseVMessRoundTrip(t *testing.T) {
 		t.Fatalf("protocol: %s", parsed.Protocol)
 	}
 	// 不支持的传输在创建时就拒绝，不等 Apply 炸全站。
-	badJSON := `{"ps":"x","add":"1.2.3.4","port":"443","id":"11111111-2222-3333-4444-555555555555","aid":"0","net":"h2","tls":"tls"}`
+	badJSON := `{"ps":"x","add":"1.2.3.4","port":"443","id":"11111111-2222-3333-4444-555555555555","aid":"0","net":"kcp","tls":"tls"}`
 	bad := "vmess://" + b64Encode(badJSON)
 	if _, err := ParseBLink(bad); err == nil {
-		t.Fatalf("vmess h2 should be rejected at parse time")
+		t.Fatalf("vmess kcp should be rejected at parse time")
+	}
+	// h2 现已支持：自产 h2 链接必须能粘贴回来。
+	h2link := VMessLink("1.2.3.4", 443, VMessConfig{UUID: "11111111-2222-3333-4444-555555555555", Mode: "h2", Domain: "example.com"}, "n", "")
+	if _, err := ParseBLink(h2link); err != nil {
+		t.Fatalf("vmess h2 link should re-parse: %v (link=%s)", err, h2link)
 	}
 	// Reality 字段必须保留，不再丢成明文。
 	realityJSON := `{"ps":"x","add":"1.2.3.4","port":443,"id":"11111111-2222-3333-4444-555555555555","aid":0,"net":"tcp","tls":"reality","sni":"example.com","pbk":"PUBKEY","sid":"abcd"}`
@@ -220,10 +228,11 @@ func TestParseVMessRoundTrip(t *testing.T) {
 		t.Fatalf("vmess reality parse: %v", err)
 	}
 	b, _ := jsonMarshal(parsed.Outbound)
-	ob, err := SingBoxBOutbound("vmess", string(b), "chain-t")
+	obs, err := SingBoxBOutbound("vmess", string(b), "chain-t")
 	if err != nil {
 		t.Fatalf("vmess reality convert: %v", err)
 	}
+	ob := obs[0]
 	tlsMap, ok := ob["tls"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("reality outbound missing tls: %v", ob)

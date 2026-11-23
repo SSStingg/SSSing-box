@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,10 +31,6 @@ import (
 )
 
 // ---------- 登录失败限流 ----------
-// 同一 IP 连续失败 5 次锁定 15 分钟（登录密码与 2FA 动态码共用一个计数，
-// 内存态，面板重启清零）。只记 IP 不记账号：面板实质只有一个管理员，
-// 按账号锁会让攻击者换个不存在的账号就绕过；按 IP 锁则 NAT 后多用户
-// 共用出口时可能误伤，15 分钟后自动解，误伤有限。
 type loginFailState struct {
 	count       int
 	firstFail   time.Time
@@ -44,6 +41,7 @@ const (
 	loginMaxFails   = 5
 	loginLockPeriod = 15 * time.Minute
 	loginFailWindow = 15 * time.Minute
+	loginMaxEntries = 10000
 )
 
 func (s *Server) loginAllowed(ip string) bool {
@@ -61,11 +59,11 @@ func (s *Server) loginAllowed(ip string) bool {
 		if now.Before(st.lockedUntil) {
 			return false
 		}
-		delete(s.loginFails, ip) // 锁过期，清零重算
+		delete(s.loginFails, ip)
 		return true
 	}
 	if now.Sub(st.firstFail) > loginFailWindow {
-		delete(s.loginFails, ip) // 窗口过期，清零重算
+		delete(s.loginFails, ip)
 	}
 	return true
 }
@@ -79,20 +77,37 @@ func (s *Server) loginFailed(ip string) {
 	if s.loginFails == nil {
 		s.loginFails = map[string]*loginFailState{}
 	}
+	now := time.Now()
 	st, ok := s.loginFails[ip]
 	if !ok {
-		s.loginFails[ip] = &loginFailState{count: 1, firstFail: time.Now()}
+		// 防随机代理 IP 无限撑大 map：超上限时先清过期项，仍满则淘汰一条未锁定旧项。
+		if len(s.loginFails) >= loginMaxEntries {
+			for k, v := range s.loginFails {
+				if (!v.lockedUntil.IsZero() && now.After(v.lockedUntil)) || (v.lockedUntil.IsZero() && now.Sub(v.firstFail) > loginFailWindow) {
+					delete(s.loginFails, k)
+				}
+			}
+			if len(s.loginFails) >= loginMaxEntries {
+				for k, v := range s.loginFails {
+					if v.lockedUntil.IsZero() {
+						delete(s.loginFails, k)
+						break
+					}
+				}
+			}
+		}
+		s.loginFails[ip] = &loginFailState{count: 1, firstFail: now}
 		return
 	}
-	if time.Since(st.firstFail) > loginFailWindow {
+	if now.Sub(st.firstFail) > loginFailWindow {
 		st.count = 1
-		st.firstFail = time.Now()
+		st.firstFail = now
 		st.lockedUntil = time.Time{}
 		return
 	}
 	st.count++
 	if st.count >= loginMaxFails {
-		st.lockedUntil = time.Now().Add(loginLockPeriod)
+		st.lockedUntil = now.Add(loginLockPeriod)
 	}
 }
 
@@ -106,9 +121,6 @@ func (s *Server) loginSucceeded(ip string) {
 }
 
 // ---------- 密码长度 ----------
-// bcrypt 硬上限 72 字节：超了 GenerateFromPassword 返回错误，以前三处都
-// 把错误吞了（hash, _ := ...），空哈希直接入库，管理员设完超长密码就
-// 永远登不上，只能进库手动修。长度与哈希错误都在这里一次性判掉。
 const maxPasswordBytes = 72
 
 func hashPassword(pw string) (string, error) {
@@ -122,19 +134,10 @@ func hashPassword(pw string) (string, error) {
 	return string(h), nil
 }
 
-// isBcryptHash：粗略判断是不是一条合法 bcrypt 哈希（$2a$/$2b$/$2y$ 开头，
-// 60 字节）。空哈希与非法值都算损坏——之前超长密码的 bug 会把空哈希
-// 写入库，那种账号对什么密码都验不过，只能走本机 CLI 重置。
 func isBcryptHash(h string) bool {
 	return len(h) == 60 && (strings.HasPrefix(h, "$2a$") || strings.HasPrefix(h, "$2b$") || strings.HasPrefix(h, "$2y$"))
 }
 
-// dummyHash：未知用户登录时也跑一次 bcrypt（时序对齐用）。值是启动时
-// 用 crypto/rand 现抽的随机数算出的一条 bcrypt 哈希，明文无人知晓，
-// 永远比对不上，只用来把响应时间拉平，让攻击者无法从快慢分辨账号存不存在。
-// 注意：绝不能用固定明文算这条哈希——固定明文写在公开源码里，攻击者
-// 拿它当口令就能直接通过比对（v1.0.2 安全修复：不存在的用户凭固定占位
-// 口令可获得管理会话）。
 var dummyHash = func() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -144,57 +147,40 @@ var dummyHash = func() string {
 	return string(h)
 }()
 
-// session 是内存登录态：24h 有效。改密码时除当前会话外全部吊销，
-// 所以会话里必须记用户名（改密码按当前登录用户查改，不再写死 admin）。
 type session struct {
 	username string
 	exp      time.Time
-	created  time.Time // 建会话时间：记住登录的轮换按它算
-	remember bool      // 30 天记住登录：轮换只针对这种长会话
+	created  time.Time
+	remember bool
 }
 
 type Server struct {
-	app      *App
-	poller   *stats.Poller
-	sessions map[string]session
-	sessMu   sync.Mutex
-	// writeMu 串行化一切写操作：两个并发 PUT/删除/链式改动不再
-	// 交错读-改-写；后台配额循环只走 applyMu，不抢这把锁，
-	// 故不存在锁顺序倒置。内核安装耗时较长，期间写接口会等它，
-	// 这是故意的：安装与 ApplyAll 交错更危险。
-	writeMu   sync.Mutex
-	startedAt time.Time
-	statsErr  string
-	statsMu   sync.Mutex
-	webFS     http.FileSystem
-
-	// 在线更新进度（update.go）：downloading/installing/restarting，空=闲置。
-	updMu    sync.Mutex
-	updPhase string
-	// 在线更新进行中守卫（update.go）：更新是长流程，进行中再点直接拒绝。
-	updRunning int32
-	// 首次监听成功后的回调（panelcert.go）：main 用它删掉更新留下的
-	// .bak 回滚备份，稳态零备份。
+	app           *App
+	poller        *stats.Poller
+	sessions      map[string]session
+	sessMu        sync.Mutex
+	writeMu       sync.Mutex
+	startedAt     time.Time
+	statsErr      string
+	statsMu       sync.Mutex
+	webFS         http.FileSystem
+	updMu         sync.Mutex
+	updPhase      string
+	updRunning    int32
 	onFirstListen func()
-	// 登录失败限流：IP -> 连续失败记录，5 次失败锁 15 分钟（内存态，重启清零）。
-	loginFailMu sync.Mutex
-	loginFails  map[string]*loginFailState
-	// 2FA 登录第二步的临时凭证（totp.go）：128 位随机 token，5 分钟有效。
-	totpTmpMu sync.Mutex
-	totpTmp   map[string]totpChallenge
-	// 面板域名证书（panelcert.go）：数据目录 certs/panel/。
-	certs *panelCertManager
-	// Serve 循环与监听重启：启用 HTTPS / 换证 / 续期时重启监听。
-	restartCh   chan struct{}
-	serveMu     sync.Mutex
-	curSrv      *http.Server
-	stopped     bool
-	servingTLS  bool
-	servingCert string
+	loginFailMu   sync.Mutex
+	loginFails    map[string]*loginFailState
+	totpTmpMu     sync.Mutex
+	totpTmp       map[string]totpChallenge
+	certs         *panelCertManager
+	restartCh     chan struct{}
+	serveMu       sync.Mutex
+	curSrv        *http.Server
+	stopped       bool
+	servingTLS    bool
+	servingCert   string
 }
 
-// mutating 把一次写操作包进 writeMu：读请求顺带等写完成，
-// 看到的总是一份完整状态。
 func (s *Server) mutating(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s.writeMu.Lock()
@@ -218,15 +204,16 @@ func New(app *App, webFS http.FileSystem) *Server {
 	return s
 }
 
-// portTags：nft 统计用的端口 -> 入站 tag 映射。
-func (s *Server) portTags() map[int]string {
-	tags := map[int]string{}
+func (s *Server) portTags() map[string]string {
+	tags := map[string]string{}
 	list, _ := s.app.Store.ListInbounds()
 	for _, in := range list {
 		if !in.Enabled {
 			continue
 		}
-		tags[in.Port] = "in-" + in.ID
+		for _, proto := range store.ProtocolTransports(in.Protocol) {
+			tags[proto+":"+strconv.Itoa(in.Port)] = "in-" + in.ID
+		}
 	}
 	return tags
 }
@@ -249,9 +236,6 @@ func okJSON(w http.ResponseWriter, v interface{}) {
 
 func (s *Server) readJSON(r *http.Request, v interface{}) error {
 	defer r.Body.Close()
-	// 请求体封顶 1MB：解码器直接读 Body 时，超大体会被
-	// 悄悄截断成“半截 JSON”——要么报错含糊，要么（配合
-	// 宽松结构）读出缺字段的请求蒙混过关。先整读、超了就拒。
 	const maxBody = 1 << 20
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
@@ -269,6 +253,38 @@ func randToken() string {
 	return hex.EncodeToString(b)
 }
 
+// isHTTPSRequest：直连 TLS，或经本机反代（X-Forwarded-Proto: https）都算 HTTPS。
+// 反代头只信任回环来源（本机 nginx/龟甲反代），外网直连的请求即使带这个头也不认，
+// 否则明文面板会被骗发 Secure cookie，导致登录后会话发不回来。
+func isHTTPSRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return false
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func (s *Server) writeSessionCookie(w http.ResponseWriter, r *http.Request, tok string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sssingbox_session",
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isHTTPSRequest(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+}
+
 func (s *Server) authed(r *http.Request) bool {
 	c, err := r.Cookie("sssingbox_session")
 	if err != nil {
@@ -281,29 +297,40 @@ func (s *Server) authed(r *http.Request) bool {
 		return false
 	}
 	if time.Now().After(sess.exp) {
-		delete(s.sessions, c.Value) // 过期会话当场清掉，不在内存里永久驻留
+		delete(s.sessions, c.Value)
 		return false
 	}
 	return true
 }
 
-// sweepExpiredSessions：定期清掉过期的内存会话（authed 只清遇到的那一条，
-// 从不登录的过期会话靠这轮清掉，免得 sessions map 无限长）。
+// sweepExpiredSessions：定期清理过期的会话、登录失败限流记录与 2FA 临时凭证，防止内存只增不减。
 func (s *Server) sweepExpiredSessions() {
-	s.sessMu.Lock()
-	defer s.sessMu.Unlock()
 	now := time.Now()
+	s.sessMu.Lock()
 	for tok, sess := range s.sessions {
 		if now.After(sess.exp) {
 			delete(s.sessions, tok)
 		}
 	}
+	s.sessMu.Unlock()
+
+	s.loginFailMu.Lock()
+	for ip, st := range s.loginFails {
+		if (!st.lockedUntil.IsZero() && now.After(st.lockedUntil)) || (st.lockedUntil.IsZero() && now.Sub(st.firstFail) > loginFailWindow) {
+			delete(s.loginFails, ip)
+		}
+	}
+	s.loginFailMu.Unlock()
+
+	s.totpTmpMu.Lock()
+	for tok, ch := range s.totpTmp {
+		if now.After(ch.exp) {
+			delete(s.totpTmp, tok)
+		}
+	}
+	s.totpTmpMu.Unlock()
 }
 
-// maybeRotateSession：记住登录（30 天）轮换。长会话被盗后 30 天都有效，
-// 所以建会话超过 7 天的记住登录在下次请求时换发新 token、旧 token 作废，
-// 有效期不变（只换凭证，不延长窗口）。24 小时会话不轮换：窗口本来就短，
-// 轮换反而会在并发请求里互相顶掉。
 func (s *Server) maybeRotateSession(w http.ResponseWriter, r *http.Request) {
 	c, err := r.Cookie("sssingbox_session")
 	if err != nil {
@@ -315,15 +342,13 @@ func (s *Server) maybeRotateSession(w http.ResponseWriter, r *http.Request) {
 		s.sessMu.Unlock()
 		return
 	}
-	// 轮换：新 token、同过期时间、同用户；旧 token 立即作废。
 	newTok := randToken()
 	s.sessions[newTok] = session{username: sess.username, exp: sess.exp, created: time.Now(), remember: true}
 	delete(s.sessions, c.Value)
 	s.sessMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "sssingbox_session", Value: newTok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int(time.Until(sess.exp).Seconds())})
+	s.writeSessionCookie(w, r, newTok, int(time.Until(sess.exp).Seconds()))
 }
 
-// sessionUser 返回当前登录会话的用户名（改密码等按用户操作的接口用）。
 func (s *Server) sessionUser(r *http.Request) (string, bool) {
 	c, err := r.Cookie("sssingbox_session")
 	if err != nil {
@@ -338,8 +363,6 @@ func (s *Server) sessionUser(r *http.Request) (string, bool) {
 	return sess.username, true
 }
 
-// revokeSessionsExcept 吊销除 keep 外的全部会话（改密码后调用：
-// 偷来的旧会话立即失效，当前操作者不受影响）。
 func (s *Server) revokeSessionsExcept(keep string) {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
@@ -350,10 +373,46 @@ func (s *Server) revokeSessionsExcept(keep string) {
 	}
 }
 
+// checkSameOrigin 防御 CSRF（特别是 multipart/form-data 跨站表单上传）。
+// 只对非 GET/HEAD/OPTIONS 状态变更请求生效；本机回环（CLI/脚本）以及无 Origin/Referer 的非浏览器测试调用按同源校验。
+func checkSameOrigin(r *http.Request) bool {
+	if r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" {
+		return true
+	}
+	if isLoopbackIP(clientIPOf(r)) {
+		return true
+	}
+	src := r.Header.Get("Origin")
+	if src == "" {
+		src = r.Header.Get("Referer")
+	}
+	if src == "" {
+		// 现代浏览器跨域表单或 fetch POST 必然携带 Origin（若被 Referrer-Policy 剥离 Referer 仍有 Origin）；
+		// 只有在非浏览器直连或同站特殊策略下才同时为空，若请求是 multipart/form-data 则强制要求同源头防止 <form> 盲打。
+		ct := strings.ToLower(r.Header.Get("Content-Type"))
+		if strings.HasPrefix(ct, "multipart/form-data") || strings.HasPrefix(ct, "application/x-www-form-urlencoded") || strings.HasPrefix(ct, "text/plain") {
+			return false
+		}
+		return true
+	}
+	if src == "null" {
+		return false
+	}
+	u, err := url.Parse(src)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.authed(r) {
 			errJSON(w, 401, "未登录")
+			return
+		}
+		if !checkSameOrigin(r) {
+			errJSON(w, 403, "跨站请求已被拦截")
 			return
 		}
 		s.maybeRotateSession(w, r)
@@ -365,7 +424,6 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
-	// static
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
 			s.serveFile(w, r, "index.html")
@@ -373,40 +431,71 @@ func (s *Server) Routes() http.Handler {
 		}
 		s.serveFile(w, r, strings.TrimPrefix(r.URL.Path, "/"))
 	})
-	// auth (public)
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/login/2fa", s.handleLogin2FA)
 	mux.HandleFunc("/api/logout", s.handleLogout)
 	mux.HandleFunc("/api/me", s.handleMe)
 	mux.HandleFunc("/api/setup-status", s.handleSetupStatus)
-	mux.HandleFunc("/api/setup", s.handleSetup)
+	mux.HandleFunc("/api/setup", s.mutating(s.handleSetup))
 	mux.HandleFunc("/sub/", s.handleSub)
-	// api (authed)
+
 	auth := s.requireAuth
 	mux.HandleFunc("/api/version", auth(s.handleVersion))
 	mux.HandleFunc("/api/system", auth(s.handleSystem))
 	mux.HandleFunc("/api/usage", auth(s.handleUsage))
 	mux.HandleFunc("/api/cores", auth(s.handleCores))
-	// 进度查询不走 mutating：安装本身占着 writeMu，进度要是也等
-	// 这把锁，就永远查不到进行中的阶段（前端按钮没反馈的根因之一）。
 	mux.HandleFunc("/api/cores/progress", auth(s.handleCoreProgress))
-	mux.HandleFunc("/api/cores/", auth(s.mutating(s.handleCoreAction)))
-	// 在线更新：check 不走 mutating（Forgejo 拉取耗时，不能堵住全部写接口）；
-	// apply 走 mutating（二进制替换期间不许其他写操作交错）；progress 不走 mutating。
+	mux.HandleFunc("/api/cores/", auth(s.handleCoreAction))
 	mux.HandleFunc("/api/update/check", auth(s.handleUpdateCheck))
-	mux.HandleFunc("/api/update/apply", auth(s.mutating(s.handleUpdateApply)))
+	mux.HandleFunc("/api/update/apply", auth(s.handleUpdateApply))
 	mux.HandleFunc("/api/update/progress", auth(s.handleUpdateProgress))
-	mux.HandleFunc("/api/inbounds", auth(s.mutating(s.handleInbounds)))
-	mux.HandleFunc("/api/inbounds/", auth(s.mutating(s.handleInboundAction)))
+	mux.HandleFunc("/api/inbounds", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			s.handleInbounds(w, r)
+			return
+		}
+		s.mutating(s.handleInbounds)(w, r)
+	}))
+	mux.HandleFunc("/api/inbounds/", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			s.handleInboundAction(w, r)
+			return
+		}
+		s.mutating(s.handleInboundAction)(w, r)
+	}))
 	mux.HandleFunc("/api/suggest-port", auth(s.handleSuggestPort))
 	mux.HandleFunc("/api/sni-list", auth(s.handleSNIList))
 	mux.HandleFunc("/api/sni-random", auth(s.handleSNIRandom))
-	mux.HandleFunc("/api/bnodes", auth(s.mutating(s.handleBNodes)))
-	mux.HandleFunc("/api/bnodes/", auth(s.mutating(s.handleBNodeAction)))
+	mux.HandleFunc("/api/bnodes", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			s.handleBNodes(w, r)
+			return
+		}
+		s.mutating(s.handleBNodes)(w, r)
+	}))
+	mux.HandleFunc("/api/bnodes/", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			s.handleBNodeAction(w, r)
+			return
+		}
+		s.mutating(s.handleBNodeAction)(w, r)
+	}))
 	mux.HandleFunc("/api/bnodes-latency", auth(s.handleBNodesLatency))
-	mux.HandleFunc("/api/chains", auth(s.mutating(s.handleChains)))
-	mux.HandleFunc("/api/chains/", auth(s.mutating(s.handleChainAction)))
-	mux.HandleFunc("/api/settings", auth(s.mutating(s.handleSettings)))
+	mux.HandleFunc("/api/chains", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			s.handleChains(w, r)
+			return
+		}
+		s.mutating(s.handleChains)(w, r)
+	}))
+	mux.HandleFunc("/api/chains/", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			s.handleChainAction(w, r)
+			return
+		}
+		s.mutating(s.handleChainAction)(w, r)
+	}))
+	mux.HandleFunc("/api/settings", auth(s.handleSettings))
 	mux.HandleFunc("/api/settings/", auth(s.mutating(s.handleSettingsAction)))
 	mux.HandleFunc("/api/settings/2fa/status", auth(s.handle2FAStatus))
 	mux.HandleFunc("/api/settings/2fa/begin", auth(s.mutating(s.handle2FABegin)))
@@ -434,6 +523,8 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name string) 
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
 	switch {
 	case strings.HasSuffix(name, ".html"):
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -444,8 +535,6 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name string) 
 	case strings.HasSuffix(name, ".svg"):
 		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
 	}
-	// 首页注入当前根路径前缀：前端拼静态地址和 API 地址都靠它；
-	// 根目录模式下替换为空串，页面行为与以前完全一致。
 	if name == "index.html" {
 		b, err := io.ReadAll(f)
 		if err != nil {
@@ -453,8 +542,6 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name string) 
 			return
 		}
 		b = bytes.ReplaceAll(b, []byte("__PANEL_BASE__"), []byte(s.panelBase()))
-		// 静态资源带版本号：换版后 URL 就变，浏览器不会拿旧 app.js
-		// 继续跑（在线升级完前端修复“没生效”多半是这个原因）。
 		b = bytes.ReplaceAll(b, []byte("__APP_VERSION__"), []byte(version.Version))
 		w.Write(b)
 		return
@@ -485,17 +572,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	hash, err := s.app.Store.GetUser(body.Username)
 	if err != nil {
-		// 未知用户也跑一次 bcrypt（dummyHash）：不跑的话未知用户直接 401，
-		// 响应时间明显短于已知用户，时序上能枚举账号。
 		hash = dummyHash
 	}
 	if !s.loginAllowed(clientIPOf(r)) {
 		errJSON(w, 429, "登录失败次数过多，请 15 分钟后再试")
 		return
 	}
-	// 已损坏的密码哈希（空或非法）：之前超长密码的 bug 会把空哈希
-	// 写入库，对什么密码都验不过。明说修复路，别只给“账号或密码不对”
-	// 让用户干等。未知用户走 dummyHash（合法哈希），不会误进这条。
 	if err == nil && !isBcryptHash(hash) {
 		s.loginFailed(clientIPOf(r))
 		errJSON(w, 401, "账号密码已损坏，请用本机 CLI（sssingbox admin reset）重置密码")
@@ -506,21 +588,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 401, "账号或密码不对")
 		return
 	}
-	// 纵深防御：未知用户即使比对通过也不发会话。dummyHash 是随机数，
-	// 正常情况下不可能通过；这里是万一哈希逻辑被改坏时的最后一道闸。
-	// 注意顺序：bcrypt 必须先跑完再判，不能跳过比对直接 401，否则
-	// 未知用户的响应时间明显短于已知用户，时序上能枚举账号。
 	if err != nil {
 		s.loginFailed(clientIPOf(r))
 		errJSON(w, 401, "账号或密码不对")
 		return
 	}
 	s.loginSucceeded(clientIPOf(r))
-	// 2FA 第二步：已开通、本机回环之外、且该 IP 没验证过时，不直接发会话，
-	// 只给一个 5 分钟有效的临时凭证，前端凭它再交一次动态码。
-	// 记住登录的时长选择也带进临时凭证，第二步建会话时再兑现。
-	// 密钥损坏时 fail-closed：直接拒绝登录（本机回环除外——SSH 菜单要靠
-	// 回环登录来恢复，堵了它就没人能修了）。
 	totpState, _ := s.totpSecretRead("totp_secret")
 	if !isLoopbackIP(clientIPOf(r)) && totpState == totpSecretBroken {
 		errJSON(w, 500, "二次验证密钥损坏，请用本机 SSH 菜单关闭二次验证后重新开通")
@@ -532,8 +605,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		okJSON(w, map[string]interface{}{"need_2fa": true, "tmp": tmp})
 		return
 	}
-	// 记住登录：会话与 cookie 一起延长到 30 天（不绑 IP：出口 IP 会变，
-	// 绑 IP 反而把人踢下线）；不勾则保持 24 小时。
 	exp := time.Now().Add(24 * time.Hour)
 	maxAge := 86400
 	if body.Remember {
@@ -544,14 +615,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.sessMu.Lock()
 	s.sessions[tok] = session{username: body.Username, exp: exp, created: time.Now(), remember: body.Remember}
 	s.sessMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "sssingbox_session", Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: maxAge})
+	s.writeSessionCookie(w, r, tok, maxAge)
 	okJSON(w, map[string]interface{}{"username": body.Username})
 }
 
-// handleLogin2FA：登录第二步。凭第一步的临时凭证 + 动态码（或恢复码）
-// 换正式会话；临时凭证用一次就作废（Take 时直接删），输错码要重新登录
-// 领新凭证，不许拿同一个凭证反复试；动态码失败也计入登录限流。
-// 成功后该 IP 记为已验证，下次直接登录。
 func (s *Server) handleLogin2FA(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		errJSON(w, 405, "method")
@@ -574,8 +641,6 @@ func (s *Server) handleLogin2FA(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 401, "验证已过期，请重新登录")
 		return
 	}
-	// 密钥损坏时 fail-closed：动态码验不了，恢复码也不放行（第一步已经
-	// 拦住了，这里是纵深防御）——恢复路是本机 SSH 菜单。
 	totpState, secret := s.totpSecretRead("totp_secret")
 	if totpState == totpSecretBroken {
 		errJSON(w, 500, "二次验证密钥损坏，请用本机 SSH 菜单关闭二次验证后重新开通")
@@ -588,8 +653,6 @@ func (s *Server) handleLogin2FA(w http.ResponseWriter, r *http.Request) {
 		passed = true
 	}
 	if !passed {
-		// 临时凭证在 Take 时已经消费掉，输错码要重新登录领新凭证；
-		// 这次失败计入登录限流（5 次锁 15 分钟）。
 		s.loginFailed(clientIPOf(r))
 		errJSON(w, 401, "动态码不对")
 		return
@@ -605,7 +668,7 @@ func (s *Server) handleLogin2FA(w http.ResponseWriter, r *http.Request) {
 	s.sessMu.Lock()
 	s.sessions[tok] = session{username: ch.username, exp: exp, created: time.Now(), remember: ch.remember}
 	s.sessMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "sssingbox_session", Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: maxAge})
+	s.writeSessionCookie(w, r, tok, maxAge)
 	s.totpMarkIP(clientIPOf(r))
 	okJSON(w, map[string]interface{}{"username": ch.username})
 }
@@ -616,7 +679,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		delete(s.sessions, c.Value)
 		s.sessMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "sssingbox_session", Value: "", Path: "/", MaxAge: -1})
+	s.writeSessionCookie(w, r, "", -1)
 	okJSON(w, nil)
 }
 
@@ -630,21 +693,17 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------- first-run setup ----------
-// 初始设置：只有数据库里一个用户都没有时才能用，建好第一个管理员后
-// 这两个接口就再也进不来（已有管理员的面板不受影响）。
 
 func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
-	// version 供更新后轮询比对：光通着不算成功，版本号对上了才算
-	// （v1.0.2 修：以前只看通不通，旧进程一直通着，前端谎称更新完成）。
 	okJSON(w, map[string]interface{}{"setup_required": s.app.Store.UserCount() == 0, "version": version.Version})
 }
 
-func (s *Server) setSession(w http.ResponseWriter, username string) {
+func (s *Server) setSession(w http.ResponseWriter, r *http.Request, username string) {
 	tok := randToken()
 	s.sessMu.Lock()
 	s.sessions[tok] = session{username: username, exp: time.Now().Add(24 * time.Hour), created: time.Now(), remember: false}
 	s.sessMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "sssingbox_session", Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	s.writeSessionCookie(w, r, tok, 86400)
 }
 
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
@@ -666,8 +725,8 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Username = strings.TrimSpace(body.Username)
-	if body.Username == "" {
-		errJSON(w, 400, "用户名不能为空")
+	if body.Username == "" || len(body.Username) > 32 || strings.ContainsAny(body.Username, " \t\n") {
+		errJSON(w, 400, "用户名不能为空、不能含空格、不能超 32 位")
 		return
 	}
 	if len(body.Password) < 6 {
@@ -687,18 +746,15 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 500, err.Error())
 		return
 	}
-	// 新装默认根路径：初始设置时才生成（只跑这一次），老面板升级不受影响。
 	panelPath := s.app.Store.GetSetting("panel_path")
 	if panelPath == "" {
 		panelPath = randPanelPath()
 		_ = s.app.Store.SetSetting("panel_path", panelPath)
 	}
-	s.setSession(w, body.Username)
+	s.setSession(w, r, body.Username)
 	okJSON(w, map[string]interface{}{"username": body.Username, "panel_path": panelPath})
 }
 
-// effectiveAddress：节点链接/订阅用的 host。当前选用证书的首域名就是面板域名，
-// 直接用它；没选证书才用服务器 IP（面板域名模块已删，不再有第三个域名来源）。
 func (s *Server) effectiveAddress(in *store.Inbound) string {
 	if s.certs != nil {
 		for _, c := range s.certs.listCerts() {
@@ -712,9 +768,6 @@ func (s *Server) effectiveAddress(in *store.Inbound) string {
 
 // ---------- system & usage ----------
 
-// handleVersion：面板自身版本 + 更新源状态。
-// 更新源已固定为面板自己的 Forgejo 仓库（cores.PanelRepo），
-// 不再靠 update_url 设置项——源一直都在，一键更新始终启用。
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	okJSON(w, map[string]interface{}{
 		"version":                  version.Version,
@@ -781,27 +834,26 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	var nodes []node
 	var tTodayUp, tTodayDown, tMonthUp, tMonthDown, tTotalUp, tTotalDown int64
+	tcpByPort := sysinfo.TCPConnectionsByPort()
+	udpByPort, udpOK := sysinfo.UDPConntrackByPort()
 	for _, in := range inbounds {
 		d := daily[in.ID]
 		m := monthly[in.ID]
 		t := total[in.ID]
 		rt := rates["in-"+in.ID]
-		// 停用的节点没有监听：按端口数出来的连接只会是别的程序
-		// 的，算到它头上是张冠李戴，直接记 0。
-		// -1 是前端约定的“无 UDP”哨兵（非 UDP 协议保持 -1，
-		// 前端据此不把该节点计入 UDP 合计），别改成 0。
 		tcp, udp := 0, 0
 		if in.Enabled {
-			tcp = sysinfo.TCPConnections(map[int]bool{in.Port: true})
-			if in.Protocol == "hy2" || in.Protocol == "tuic" || in.Protocol == "wireguard" {
-				udp = sysinfo.UDPConntrack(map[int]bool{in.Port: true})
+			tcp = tcpByPort[in.Port]
+			if store.UDPOnlyProtocol(in.Protocol) {
+				if udpOK {
+					udp = udpByPort[in.Port]
+				} else {
+					udp = -1
+				}
 			} else {
-				// -1 是前端约定的“无 UDP”哨兵：前端据此不把该
-				// 节点计入 UDP 合计，改成 0 会让合计行误显示。
 				udp = -1
 			}
 		}
-		// 全部节点都跑在 sing-box 里（含 hy2/tuic/naive/wg）。
 		running := s.app.Sup.Status("sing-box").Running && in.Enabled
 		online := 0
 		link, tme := s.inboundLinks(in)
@@ -867,8 +919,6 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 		if c != nil {
 			ver, latest = c.Version, c.Latest
 		}
-		// 版本兜底：二进制是手动放进来的（没走面板安装），DB 里没有版本号时
-		// 直接问二进制自己，问到了就显示并补记到 DB，卡片不再空着。
 		if installed && ver == "" && d.Name == "sing-box" {
 			if v := cores.DetectSingBoxVersion(s.app.Mgr.BinPath("sing-box")); v != "" {
 				ver = v
@@ -892,8 +942,6 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 	okJSON(w, out)
 }
 
-// handleCoreProgress：返回各内核当前的安装阶段（downloading/installing）。
-// 前端安装时每 800ms 查一次，按真实阶段改按钮文案；安装结束后进度自动清掉。
 func (s *Server) handleCoreProgress(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		errJSON(w, 405, "method")
@@ -921,8 +969,6 @@ func (s *Server) handleCoreAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 405, "method")
 			return
 		}
-		// 默认只列正式版；版本弹窗“显示所有内核”时带 ?all=1，含测试版。
-		// “检查更新”“更新到最新版”不走这里，仍只认正式版。
 		var rels []cores.Release
 		var err error
 		if r.URL.Query().Get("all") == "1" {
@@ -948,23 +994,26 @@ func (s *Server) handleCoreAction(w http.ResponseWriter, r *http.Request) {
 			Version string `json:"version"`
 		}
 		_ = s.readJSON(r, &body)
-		var tag string
-		var err error
-		tag, err = s.app.Mgr.Install(name, body.Version)
+		tag, err := s.app.Mgr.Install(name, body.Version)
 		if err != nil {
 			errJSON(w, 500, "下载安装失败："+err.Error())
 			return
 		}
+		s.writeMu.Lock()
 		recErr := s.app.Store.UpsertCore(&store.Core{Name: name, Version: tag, Installed: true, Latest: tag, LastCheck: time.Now().Unix()})
-		if err := s.app.ApplyAll(); err != nil {
-			errJSON(w, 500, "安装成功但启动失败："+err.Error())
+		applyErr := s.app.ApplyAll()
+		if applyErr == nil {
+			s.poller.Reset()
+		}
+		s.writeMu.Unlock()
+		if applyErr != nil {
+			errJSON(w, 500, "安装成功但启动失败："+applyErr.Error())
 			return
 		}
 		if recErr != nil {
 			errJSON(w, 500, "安装成功但版本记录失败（下次打开核心卡片会显示旧版本）："+recErr.Error())
 			return
 		}
-		s.poller = stats.NewPoller(s.portTags)
 		okJSON(w, map[string]interface{}{"version": tag})
 	case "check":
 		if r.Method != "POST" {
@@ -997,7 +1046,10 @@ func (s *Server) handleCoreAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 405, "method")
 			return
 		}
-		if err := s.app.ApplyAll(); err != nil {
+		s.writeMu.Lock()
+		err := s.app.ApplyAll()
+		s.writeMu.Unlock()
+		if err != nil {
 			errJSON(w, 500, "重启失败："+err.Error())
 			return
 		}
@@ -1018,8 +1070,6 @@ func (s *Server) handleCoreAction(w http.ResponseWriter, r *http.Request) {
 		}
 		okJSON(w, strings.Join(lines, "\n"))
 	case "clear-log":
-		// 手动清理：立即清空该内核的日志文件。运行中的核心不受影响，
-		// 监督器持有 O_APPEND 句柄，后续日志写到清空后的文件开头。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -1087,19 +1137,11 @@ func (s *Server) inboundLinks(in *store.Inbound) (link, tme string) {
 	case "shadowtls":
 		var cfg proxy.ShadowTLSConfig
 		_ = json.Unmarshal([]byte(in.Config), &cfg)
-		return proxy.ShadowTLSClientJSON(addr, in.Port, cfg, in.Name), ""
+		return proxy.ShadowTLSLink(addr, in.Port, cfg, in.Name), ""
 	}
 	return "", ""
 }
 
-// inboundLinks6 builds the same node link as inboundLinks, but over the
-// server's public IPv6 address. It returns "" when the server has no
-// public IPv6, and for domain-based nodes (CF/TLS modes, Naive) whose link
-// host is a domain (not a server IP) — those need no separate IPv6 link. URL-style links get the
-// bracketed host ([ipv6]:port); VMess "add" takes the
-// bare address, as that format requires.
-// inboundListensV6：该入站是否真的在双栈上监听。WireGuard endpoint
-// 不写 listen、天然双 socket，恒为真；其余 sing-box 入站空 Listen 表示走默认 "::"（双栈）。
 func inboundListensV6(in *store.Inbound) bool {
 	if in.Protocol == "wireguard" {
 		return true
@@ -1165,13 +1207,10 @@ func (s *Server) inboundLinks6(in *store.Inbound) (link, tme string) {
 	if ip6 == "" {
 		return "", ""
 	}
-	// 只给真双栈监听的入站发 v6 链接：以前不管监听是什么都发，v4-only
-	// 节点的 link6 根本连不上，纯误导。空 Listen 表示走默认 "::"（双栈）。
 	if !inboundListensV6(in) {
 		return "", ""
 	}
 	b := ip6
-	// v6 链接名字后加 -ipv6：订阅里 v4/v6 两行同名，客户端里分不清。
 	name := in.Name + "-ipv6"
 	switch in.Protocol {
 	case "vless":
@@ -1224,7 +1263,6 @@ func (s *Server) inboundLinks6(in *store.Inbound) (link, tme string) {
 		_ = json.Unmarshal([]byte(in.Config), &cfg)
 		return proxy.AnyTLSLink(b, in.Port, in.SNI, cfg, name), ""
 	case "naive":
-		// Naive 链接 host 是真实域名，不需要单独的 IPv6 链接。
 		return "", ""
 	case "snell":
 		var cfg proxy.SnellConfig
@@ -1233,9 +1271,19 @@ func (s *Server) inboundLinks6(in *store.Inbound) (link, tme string) {
 	case "shadowtls":
 		var cfg proxy.ShadowTLSConfig
 		_ = json.Unmarshal([]byte(in.Config), &cfg)
-		return proxy.ShadowTLSClientJSON(b, in.Port, cfg, name), ""
+		return proxy.ShadowTLSLink(b, in.Port, cfg, name), ""
 	}
 	return "", ""
+}
+
+// resyncAfterRollback：应用失败后库已回滚，但内核可能已按坏配置重启过
+// （ApplyAll 先重启内核、后同步跳端口 nft，nft 一失败内核就留着坏配置跑）。
+// 库已干净，再应用一次把运行中的内核同步回库的状态。失败只记日志，
+// 不改动本次已返回给用户的错误。
+func (s *Server) resyncAfterRollback() {
+	if err := s.app.ApplyAll(); err != nil {
+		log.Printf("回滚后重应用失败（内核与库可能不一致）：%v", err)
+	}
 }
 
 func (s *Server) handleInbounds(w http.ResponseWriter, r *http.Request) {
@@ -1290,16 +1338,12 @@ func (s *Server) handleInbounds(w http.ResponseWriter, r *http.Request) {
 		if body.QuotaMode == "" {
 			body.QuotaBytes = 0
 		}
-		// 限额校验必须在 createInbound 之前：createInbound 内部会先落盘一次，
-		// 校验放后面时 400 照样返回、节点却已入库（回归复测抓到的真 bug：
-		// quota 0/-5 返回 400，T-Q 节点却留在了库里）。
-		// 限额 <=0 时 checkQuota 又把它当无限制跳过，等于假限额。
 		if body.QuotaMode != "" && body.QuotaBytes <= 0 {
 			errJSON(w, 400, "流量限额必须大于 0（不限量请把模式留空）")
 			return
 		}
 		if core := requiredCore(body.Protocol); core != "" && !s.app.Mgr.Installed(core) {
-			errJSON(w, 400, core+" 内核还没安装：先去“系统状态”页的内核卡片安装 "+core+"，装好再创建节点")
+			errJSON(w, 400, core+" 内核还没安装：先去“系统概览”页的内核卡片安装 "+core+"，装好再创建节点")
 			return
 		}
 		in, err := s.createInbound(body.Protocol, body.Port, body.Name, body.Address, body.SNI, body.Advanced)
@@ -1316,7 +1360,9 @@ func (s *Server) handleInbounds(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.app.ApplyAll(); err != nil {
-			errJSON(w, 500, "节点已保存但启动失败："+err.Error())
+			_ = s.app.Store.DeleteInbound(in.ID)
+			s.resyncAfterRollback()
+			errJSON(w, 500, "节点启动失败（已撤销创建）："+err.Error())
 			return
 		}
 		link, tme := s.inboundLinks(in)
@@ -1327,7 +1373,6 @@ func (s *Server) handleInbounds(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// advancedMode：创建/编辑节点请求里 advanced.mode（前端传的传输模式）。
 func advancedMode(adv map[string]interface{}) string {
 	if adv == nil {
 		return ""
@@ -1336,7 +1381,6 @@ func advancedMode(adv map[string]interface{}) string {
 	return m
 }
 
-// configMode：已存节点的传输模式（编辑时 advanced 没传 mode 就用它判断）。
 func configMode(protocol, configJSON string) string {
 	switch protocol {
 	case "vless":
@@ -1351,10 +1395,6 @@ func configMode(protocol, configJSON string) string {
 	return ""
 }
 
-// validSNI：SNI 必须是合法主机名或 IP 字面量。面板以前照单全收，
-// "a b.com"、中文域名、300 字符这种垃圾 SNI 也能建成“跑着但永远
-// 连不上”的节点（sing-box check 照过，TLS 握手时才死），行为测试
-// 1.5 实测确认。空串不由这里判（创建时部分协议会自动补 SNI）。
 func validSNI(s string) bool {
 	s = strings.TrimSuffix(s, ".")
 	if s == "" || len(s) > 253 {
@@ -1385,26 +1425,26 @@ func (s *Server) suggestPort(protocol string, mode ...string) (int, string) {
 	udpUsed := sysinfo.BoundUDPPorts()
 	list, _ := s.app.Store.ListInbounds()
 	for _, in := range list {
-		// TCP 与 UDP 端口分开编号：节点端口只记到自己那边的表里，
-		// 别让面板里的 UDP 节点拦住 TCP 建议（或反过来）。
-		if store.UDPOnlyProtocol(in.Protocol) {
-			udpUsed[in.Port] = true
-		} else {
-			tcpUsed[in.Port] = true
+		for _, t := range store.ProtocolTransports(in.Protocol) {
+			if t == "udp" {
+				udpUsed[in.Port] = true
+			} else {
+				tcpUsed[in.Port] = true
+			}
 		}
-		// 统计端口也要预留：HY2 的 StatsPort 只在进程跑着时才占
-		// 系统端口；节点停着时 ListeningTCPPorts 里没有它，
-		// suggestPort 若把 19000-19999 段内的统计端口建议出去，
-		// HY2 下次启动就绑不上统计端口（用量直接断掉）。
-		// 兜底范围也一样：10000-19999 的 fallback 会扫进统计段。
-		var sp struct {
-			StatsPort int `json:"stats_port"`
+		if in.Protocol == "hy2" {
+			var hc proxy.Hy2Config
+			if json.Unmarshal([]byte(in.Config), &hc) == nil {
+				if hc.StatsPort > 0 {
+					tcpUsed[hc.StatsPort] = true
+				}
+				if start, end, err := proxy.ParseHopPorts(hc.HopPorts); err == nil {
+					for p := start; p <= end; p++ {
+						udpUsed[p] = true
+					}
+				}
+			}
 		}
-		if in.Protocol == "hy2" && json.Unmarshal([]byte(in.Config), &sp) == nil && sp.StatsPort > 0 {
-			tcpUsed[sp.StatsPort] = true
-		}
-		// ShadowTLS 内层 SS 的回环端口也要预留：suggestPort 若把它
-		// 建议出去，新节点一启用就和内层 SS 抢端口。
 		if in.Protocol == "shadowtls" {
 			var stc proxy.ShadowTLSConfig
 			if json.Unmarshal([]byte(in.Config), &stc) == nil && stc.InnerPort > 0 {
@@ -1412,23 +1452,22 @@ func (s *Server) suggestPort(protocol string, mode ...string) (int, string) {
 			}
 		}
 	}
-	// panel's own ports
 	if p := s.app.Store.GetSetting("panel_port"); p != "" {
 		if n, err := strconv.Atoi(p); err == nil {
 			tcpUsed[n] = true
 		}
 	}
-	// sing-box 没有 xray 那种 API 端口，不再预留 10085；中转端口 18099 也随旧架构退役。
 	free := func(p int) bool {
-		// TCP 与 UDP 端口分开编号（见 store.UDPOnlyProtocol）：UDP 协议只看
-		// UDP 有没有被占，TCP 协议只看 TCP，别拿另一边的占用误拦。
-		if store.UDPOnlyProtocol(protocol) {
-			return !udpUsed[p]
+		for _, t := range store.ProtocolTransports(protocol) {
+			if t == "udp" && udpUsed[p] {
+				return false
+			}
+			if t == "tcp" && tcpUsed[p] {
+				return false
+			}
 		}
-		return !tcpUsed[p]
+		return true
 	}
-	// VMess/Trojan 的 CF 模式例外：源站端口必须是 CF 允许的代理端口，
-	// 否则 CF 根本不转发，节点就是死的。
 	if (protocol == "vmess" || protocol == "trojan") && len(mode) > 0 && mode[0] == "cf" {
 		for _, p := range proxy.CFPorts {
 			if free(p) {
@@ -1437,12 +1476,6 @@ func (s *Server) suggestPort(protocol string, mode ...string) (int, string) {
 		}
 		return 0, "CF 允许的端口都被占用了"
 	}
-	// 顺序是抗封禁的取舍，不是随便排的：TCP 协议 443 最像正常 HTTPS，
-	// 8443 是次选；两个都被占才去高位随机端口，常用端口
-	// （2053/2083/2096 这些代理圈熟面孔）不再主动建议，
-	// 免得一眼就被认出来是代理。
-	// HY2/TUIC 是 UDP/QUIC：UDP 443 是标准 QUIC 端口，国内运营商会拦，
-	// 默认不建议 443；先给 8443，8443 被占才去高位随机端口。
 	if protocol == "hy2" || protocol == "tuic" {
 		if free(8443) {
 			return 8443, "8443 端口可用"
@@ -1486,7 +1519,6 @@ func portOccupier(port int) string {
 		if !strings.Contains(line, ":"+strconv.Itoa(port)+" ") && !strings.Contains(line, ":"+strconv.Itoa(port)+"\t") {
 			continue
 		}
-		// users:(("nginx",pid=...,fd=...))
 		if i := strings.Index(line, `users:(("`); i >= 0 {
 			rest := line[i+len(`users:(("`):]
 			if j := strings.Index(rest, `"`); j > 0 {
@@ -1497,9 +1529,6 @@ func portOccupier(port int) string {
 	return ""
 }
 
-// requiredCore：每种入站协议跑在哪个内核上。全部协议都跑在 sing-box；
-// 以前创建时不拦，节点存进去了却永远是“核心未启动”，用户还以为建好了——
-// 所以创建和克隆时先拦，缺核就明说去装。
 func requiredCore(protocol string) string {
 	switch protocol {
 	case "vless", "vmess", "ss", "socks", "http", "trojan", "wireguard", "hy2", "tuic", "anytls", "naive", "snell", "shadowtls":
@@ -1508,11 +1537,6 @@ func requiredCore(protocol string) string {
 	return ""
 }
 
-// normalizeVLESS/normalizeVMess/normalizeTrojan：创建与编辑共用的按模式归一化。
-// 空 Mode 按默认档处理；非法 Mode 直接报错，绝不静默改写成默认档
-// （以前非法值被悄悄改成 Reality/TCP，服务端与用户意图脱节，链接还跟着错）。
-// 编辑时复用同一函数：模式切换后旧档残留字段（WS 的 Domain/Path、
-// Reality 的密钥/Dest）按新档重算，不再出现“切回 Reality 还留着 WS 路径”。
 func (s *Server) normalizeVLESS(cfg *proxy.VLESSConfig, sni string) error {
 	switch cfg.Mode {
 	case "ws", "h2", "httpupgrade":
@@ -1602,10 +1626,6 @@ func (s *Server) normalizeTrojan(cfg *proxy.TrojanConfig, sni string, port int) 
 	return nil
 }
 
-// normalizeSnell：创建与编辑共用。Version 非 5/6 直接报错，
-// 不静默改回 5（用户意图与服务端脱节）；v6 的 PSK 必须
-// 12-255 字节，短了直接报错，不自动拉长（拉长等于换密码，
-// 旧链接悄悄失效）。
 func (s *Server) normalizeSnell(cfg *proxy.SnellConfig) error {
 	switch cfg.Version {
 	case 0:
@@ -1625,7 +1645,8 @@ func (s *Server) normalizeSnell(cfg *proxy.SnellConfig) error {
 			return fmt.Errorf("不支持的 Snell 混淆模式：%s（只支持 none / http）", cfg.ObfsMode)
 		}
 		if cfg.ObfsMode == "http" && cfg.ObfsHost == "" {
-			cfg.ObfsHost = "bing.com"
+			// 留空 = 从 SNI 池随机推荐，bing.com 永不入选。
+			cfg.ObfsHost = proxy.RandomSnellObfsHost()
 		}
 	} else {
 		if len(cfg.PSK) < 12 || len(cfg.PSK) > 255 {
@@ -1641,9 +1662,6 @@ func (s *Server) normalizeSnell(cfg *proxy.SnellConfig) error {
 	return nil
 }
 
-// normalizeShadowTLS：创建与编辑共用。版本只认 3；
-// strict_mode 强制 true（最佳预设，不开放关闭）；
-// 握手站必须是合法域名；内层 SS 缺失时按默认补齐。
 func (s *Server) normalizeShadowTLS(cfg *proxy.ShadowTLSConfig) error {
 	cfg.Version = 3
 	cfg.StrictMode = true
@@ -1691,20 +1709,17 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 		return nil, fmt.Errorf("端口 %d 已被本面板其他节点占用", port)
 	}
 	tcpUsed := sysinfo.ListeningTCPPorts()
-	if !store.UDPOnlyProtocol(protocol) && tcpUsed[port] {
-		return nil, fmt.Errorf("端口 %d 已被系统其他程序占用", port)
-	}
-	if protocol == "hy2" && sysinfo.BoundUDPPorts()[port] {
-		return nil, fmt.Errorf("端口 %d 的 UDP 已被占用（Hy2 需要 UDP）", port)
-	}
-	if protocol == "tuic" && sysinfo.BoundUDPPorts()[port] {
-		return nil, fmt.Errorf("端口 %d 的 UDP 已被占用（TUIC 需要 UDP）", port)
-	}
-	if protocol == "wireguard" && sysinfo.BoundUDPPorts()[port] {
-		return nil, fmt.Errorf("端口 %d 的 UDP 已被占用（WireGuard 走 UDP）", port)
+	udpUsed := sysinfo.BoundUDPPorts()
+	for _, t := range store.ProtocolTransports(protocol) {
+		if t == "tcp" && tcpUsed[port] {
+			return nil, fmt.Errorf("端口 %d 的 TCP 已被系统其他程序占用", port)
+		}
+		if t == "udp" && udpUsed[port] {
+			return nil, fmt.Errorf("端口 %d 的 UDP 已被系统其他程序占用", port)
+		}
 	}
 	if name == "" {
-		short := map[string]string{"vless": "VLESS", "hy2": "HY2", "vmess": "VMESS", "ss": "SS", "socks": "SOCKS", "http": "HTTP", "trojan": "TROJAN", "wireguard": "WG", "tuic": "TUIC", "anytls": "ANYTLS", "naive": "NAIVE", "snell": "SNELL", "shadowtls": "SHADOWTLS"}[protocol]
+		short := map[string]string{"vless": "VLESS", "hy2": "HY2", "vmess": "VMess", "ss": "SS", "socks": "SOCKS", "http": "HTTP", "trojan": "TROJAN", "wireguard": "WG", "tuic": "TUIC", "anytls": "ANYTLS", "naive": "NAIVE", "snell": "SNELL", "shadowtls": "SHADOWTLS"}[protocol]
 		name = fmt.Sprintf("%s-%d", short, port)
 	}
 	if address == "" {
@@ -1713,9 +1728,6 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 			return nil, fmt.Errorf("无法自动获取公网 IP，请手动填写节点地址")
 		}
 	}
-	// 只有需要域名的协议才自动给 SNI：SS/SOCKS/HTTP/VMess-TCP
-	// 的 SNI 毫无意义，留空；VMess/Trojan 的 CF 模式域名是必填项，
-	// 没填直接报错，不拿精选清单糊弄。
 	vmessCF := protocol == "vmess"
 	if vmessCF {
 		if m, ok := advanced["mode"].(string); ok && m == "cf" {
@@ -1736,13 +1748,9 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 			trojanCF = false
 		}
 	}
-	// Naive 必须用真实域名 + CA 证书：没域名直接报错，不拿精选清单糊弄。
 	if protocol == "naive" && sni == "" {
 		return nil, fmt.Errorf("Naive 需要填写真实域名（CA 证书上的域名，解析到本机）")
 	}
-	// TLS 档（VLESS WS/H2/HTTPUpgrade、Trojan H2/HTTPUpgrade）留空域名时不再拿
-	// Reality 伪装清单自动填 SNI：伪装域名不指向本机，填进链接就成了死链；
-	// 留空时链接改用服务器地址（见各 Link builder 的 address 回退），同样能通。
 	tlsMode := false
 	if m, ok := advanced["mode"].(string); ok {
 		if protocol == "vless" && (m == "ws" || m == "h2" || m == "httpupgrade") {
@@ -1772,7 +1780,6 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 	case "hy2":
 		cfg := proxy.DefaultHy2()
 		mergeAdvanced(&cfg, advanced)
-		// sing-box Hy2 没有 hysteria 二进制的 stats 端口，不再分配 StatsPort/StatsSecret。
 		if cfg.HopPorts != "" {
 			if err := proxy.ValidateHopPorts(cfg.HopPorts, sysinfo.BoundUDPPorts(), port); err != nil {
 				return nil, err
@@ -1789,9 +1796,6 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 	case "ss":
 		cfg := proxy.DefaultSS()
 		mergeAdvanced(&cfg, advanced)
-		// 2022 方法的密码必须是对应长度的密钥：用户没填密码
-		// 就按最终选的方法重生成，不能拿默认方法的密钥凑合，
-		// 否则 xray 会因为密钥长度不对起不来。
 		if pw, ok := advanced["password"].(string); !ok || pw == "" {
 			cfg.Password = proxy.SSKey(cfg.Method)
 		}
@@ -1799,8 +1803,6 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 	case "socks":
 		cfg := proxy.DefaultSocks()
 		mergeAdvanced(&cfg, advanced)
-		// 空凭证绝不能入库：以前只在 Apply 层拦，节点已保存为启用态，
-		// 之后每次 Apply 都失败，等于毒丸；创建时直接 400。
 		if cfg.User == "" || cfg.Pass == "" {
 			return nil, fmt.Errorf("SOCKS 节点必须设置用户名和密码（空凭证会变成无认证公开代理）")
 		}
@@ -1830,8 +1832,6 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 	case "naive":
 		cfg := proxy.DefaultNaive()
 		mergeAdvanced(&cfg, advanced)
-		// 域名 = SNI（真实域名，CA 证书上的名字）；证书建好节点后单独上传，
-		// 没证书时 Apply 会明说缺证书，不会偷偷自签。
 		cfg.Domain = sni
 		in.Config = store.MustJSON(cfg)
 	case "wireguard":
@@ -1869,7 +1869,6 @@ func (s *Server) createInbound(protocol string, port int, name, address, sni str
 		in.Config = store.MustJSON(cfg)
 	}
 	if protocol == "naive" {
-		// 没证书的节点先停用：上传证书时自动启用，避免一创建就启动失败。
 		in.Enabled = false
 	}
 	if err := s.app.Store.UpsertInbound(in); err != nil {
@@ -1884,8 +1883,6 @@ func randHexID() string {
 	return hex.EncodeToString(b)
 }
 
-// uniqueID：生成库里不存在的 id。以前 4 字节 + 从不判重，Upsert 碰撞
-// 即无声覆盖旧节点（用量、链式引用全被新节点继承）。
 func (s *Server) uniqueID(exists func(string) bool) string {
 	for i := 0; i < 100; i++ {
 		id := randHexID()
@@ -1893,8 +1890,6 @@ func (s *Server) uniqueID(exists func(string) bool) string {
 			return id
 		}
 	}
-	// 64 位空间里 100 次都撞上基本不可能；真撞上也返回新 id 报错给上层，
-	// 不再静默复用旧 id。
 	return randHexID()
 }
 
@@ -1908,8 +1903,6 @@ func randLetters(n int) string {
 	return string(b)
 }
 
-// allocStatsPort picks a free loopback port in 19000-19999 for hy2
-// stats endpoints (trafficStats / prometheus), avoiding DB and system use.
 func (s *Server) allocStatsPort() int {
 	used := map[int]bool{}
 	for p := range sysinfo.ListeningTCPPorts() {
@@ -1917,8 +1910,7 @@ func (s *Server) allocStatsPort() int {
 	}
 	inbounds, _ := s.app.Store.ListInbounds()
 	for _, in := range inbounds {
-		switch in.Protocol {
-		case "hy2":
+		if in.Protocol == "hy2" {
 			var cfg proxy.Hy2Config
 			_ = json.Unmarshal([]byte(in.Config), &cfg)
 			if cfg.StatsPort > 0 {
@@ -1934,9 +1926,7 @@ func (s *Server) allocStatsPort() int {
 	return 0
 }
 
-// allocInnerPort：给 ShadowTLS 内层 SS 分一个回环端口（20000-20999）。
-// 内层端口绝不能和节点端口、HY2 统计端口撞上，也不能被
-// suggestPort 再建议出去（见 suggestPort 里的预留）。
+// allocInnerPort：给 ShadowTLS 内层 SS 分配回环端口（20000-20999），并避开 Hy2 跳跃段。
 func (s *Server) allocInnerPort() int {
 	used := map[int]bool{}
 	for p := range sysinfo.ListeningTCPPorts() {
@@ -1951,6 +1941,13 @@ func (s *Server) allocInnerPort() int {
 			_ = json.Unmarshal([]byte(in.Config), &cfg)
 			if cfg.StatsPort > 0 {
 				used[cfg.StatsPort] = true
+			}
+			if start, end, err := proxy.ParseHopPorts(cfg.HopPorts); err == nil {
+				for p := start; p <= end; p++ {
+					if p >= 20000 && p < 21000 {
+						used[p] = true
+					}
+				}
 			}
 		case "shadowtls":
 			var cfg proxy.ShadowTLSConfig
@@ -1989,6 +1986,7 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 404, "节点不存在")
 		return
 	}
+	oldIn := *in
 	switch action {
 	case "":
 		switch r.Method {
@@ -2032,8 +2030,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			// PUT 清空名字/地址会留下无名节点或坏链接：创建时空名字会
-			// 自动命名，编辑时清空没有合理语义，直接拒绝。
 			if body.Name != nil && strings.TrimSpace(*body.Name) == "" {
 				errJSON(w, 400, "节点名不能为空")
 				return
@@ -2059,14 +2055,17 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					errJSON(w, 400, fmt.Sprintf("端口 %d 已被本面板其他节点占用", *body.Port))
 					return
 				}
-				if !store.UDPOnlyProtocol(in.Protocol) && sysinfo.ListeningTCPPorts()[*body.Port] {
-					errJSON(w, 400, fmt.Sprintf("端口 %d 已被系统其他程序占用", *body.Port))
-					return
-				}
-				// 编辑端口丢了创建时的 UDP 检查：Hy2/TUIC/WG 走 UDP，TCP 空闲不够。
-				if (in.Protocol == "hy2" || in.Protocol == "tuic" || in.Protocol == "wireguard") && sysinfo.BoundUDPPorts()[*body.Port] {
-					errJSON(w, 400, fmt.Sprintf("端口 %d 的 UDP 已被占用", *body.Port))
-					return
+				tcpUsed := sysinfo.ListeningTCPPorts()
+				udpUsed := sysinfo.BoundUDPPorts()
+				for _, t := range store.ProtocolTransports(in.Protocol) {
+					if t == "tcp" && tcpUsed[*body.Port] {
+						errJSON(w, 400, fmt.Sprintf("端口 %d 的 TCP 已被系统其他程序占用", *body.Port))
+						return
+					}
+					if t == "udp" && udpUsed[*body.Port] {
+						errJSON(w, 400, fmt.Sprintf("端口 %d 的 UDP 已被系统其他程序占用", *body.Port))
+						return
+					}
 				}
 				in.Port = *body.Port
 			}
@@ -2090,15 +2089,12 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			if in.QuotaMode == "" {
 				in.QuotaBytes = 0
 			}
-			// 只在本次请求动了限额时校验合并结果：历史遗留的
-			// “有模式无字节”节点，改其他字段时不被限额挡住。
 			if (body.QuotaMode != nil || body.QuotaBytes != nil) && in.QuotaMode != "" && in.QuotaBytes <= 0 {
 				errJSON(w, 400, "流量限额必须大于 0（不限量请把模式留空）")
 				return
 			}
 			if body.SNI != nil && *body.SNI != in.SNI {
 				in.SNI = *body.SNI
-				// dest follows sni unless user customized it
 				if in.Protocol == "vless" {
 					var cfg proxy.VLESSConfig
 					_ = json.Unmarshal([]byte(in.Config), &cfg)
@@ -2110,7 +2106,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					in.Config = store.MustJSON(cfg)
 				}
 				if in.Protocol == "vmess" {
-					// TLS/HTTP 档的域名既在 SNI 列也在配置里，两边同步。
 					var cfg proxy.VMessConfig
 					_ = json.Unmarshal([]byte(in.Config), &cfg)
 					if cfg.Mode == "cf" || cfg.Mode == "http" || cfg.Mode == "quic" || cfg.Mode == "h2" || cfg.Mode == "httpupgrade" {
@@ -2119,8 +2114,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				if in.Protocol == "trojan" {
-					// Reality 档换 SNI 时 dest 跟着换（除非之前手动改过）；
-					// TLS 档的域名两边同步。
 					var cfg proxy.TrojanConfig
 					_ = json.Unmarshal([]byte(in.Config), &cfg)
 					if cfg.Mode == "cf" || cfg.Mode == "h2" || cfg.Mode == "httpupgrade" {
@@ -2131,7 +2124,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					in.Config = store.MustJSON(cfg)
 				}
 				if in.Protocol == "naive" {
-					// Naive 的域名就是 SNI（CA 证书上的名字），两边同步。
 					var cfg proxy.NaiveConfig
 					_ = json.Unmarshal([]byte(in.Config), &cfg)
 					cfg.Domain = in.SNI
@@ -2144,7 +2136,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					var cfg proxy.VLESSConfig
 					_ = json.Unmarshal([]byte(in.Config), &cfg)
 					mergeAdvanced(&cfg, body.Advanced)
-					// 编辑复用创建的归一化：模式切换后旧档残留字段按新档重算。
 					if err := s.normalizeVLESS(&cfg, in.SNI); err != nil {
 						errJSON(w, 400, err.Error())
 						return
@@ -2239,8 +2230,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 						errJSON(w, 400, err.Error())
 						return
 					}
-					// 内层端口只在创建时分配：编辑绝不能把它清零，
-					// 否则 Apply 时内层 SS 没端口可听。
 					if cfg.InnerPort == 0 {
 						cfg.InnerPort = s.allocInnerPort()
 						if cfg.InnerPort == 0 {
@@ -2264,8 +2253,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 					in.Config = store.MustJSON(cfg)
 				}
 			}
-			// 端口与模式联动校验：只改端口不改模式时归一化没跑，但结果仍可能
-			// 是 CF 模式 + 非 CF 端口（死的节点），这里按合并后的结果再拦一次。
 			if in.Protocol == "vmess" || in.Protocol == "trojan" {
 				var mode string
 				if in.Protocol == "vmess" {
@@ -2288,17 +2275,16 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if err := s.app.ApplyAll(); err != nil {
-				errJSON(w, 500, "已保存但启动失败："+err.Error())
+				_ = s.app.Store.UpsertInbound(&oldIn)
+				s.resyncAfterRollback()
+				errJSON(w, 500, "修改未生效（已回滚配置）："+err.Error())
 				return
 			}
-			// 调低限额后立即结算一次：以前只靠后台增量触发，节点闲置时
-			// 超限永不生效，订阅里还继续发它的链接。
-			s.checkQuota(in.ID)
+			s.checkQuotaLocked(in.ID)
 			link, tme := s.inboundLinks(in)
 			link6, _ := s.inboundLinks6(in)
 			okJSON(w, map[string]interface{}{"inbound": in, "link": link, "link6": link6, "tme_link": tme})
 		case "DELETE":
-			// 级联清理：删节点前先记下协议与证书路径（删后就查不到了）。
 			naiveCert, naiveKey := "", ""
 			if in.Protocol == "naive" {
 				var cfg proxy.NaiveConfig
@@ -2309,9 +2295,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, 500, err.Error())
 				return
 			}
-			// 悬空链式由 DeleteInbound 的事务一并清掉（原子），
-			// 这里不再事后删——事后删失败是静默的，事务失败则
-			// 整个删除回滚，节点还在，前端如实看到 500。
 			if naiveCert != "" {
 				_ = os.Remove(naiveCert)
 			}
@@ -2342,16 +2325,9 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if core := requiredCore(in.Protocol); core != "" && !s.app.Mgr.Installed(core) {
-			errJSON(w, 400, core+" 内核还没安装：先去“系统状态”页的内核卡片安装 "+core+"，装好再克隆节点")
+			errJSON(w, 400, core+" 内核还没安装：先去“系统概览”页的内核卡片安装 "+core+"，装好再克隆节点")
 			return
 		}
-		// 克隆：同协议、同伪装域名、同高级配置，但端口重新建议、
-		// 身份凭证全部换新（UUID/Reality 密钥、Hy2 密码），
-		// Naive 证书文件单独复制一份，绝不和原节点共用。
-		// 名字 = 原名 + 随机 3 个字母；克隆出来默认是停用的，
-		// 要用的时候手动开启，避免一克隆就抢端口、跑流量。
-		// CF 节点克隆必须把 mode 传给建议端口：以前没传，443/8443
-		// 被占时克隆出 5xxxx 端口，启用即死节点（CF 不转发该端口）。
 		cloneMode := ""
 		switch in.Protocol {
 		case "vmess":
@@ -2380,10 +2356,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			var cfg proxy.VLESSConfig
 			_ = json.Unmarshal([]byte(in.Config), &cfg)
 			cfg.UUID = proxy.DefaultVLESS().UUID
-			// Reality 密钥/ShortID 只有 Reality 档用得上：TLS 档
-			// （ws/h2/httpupgrade）克隆时不带原节点的密钥对，
-			// 免得以后切回 Reality 时误以为这是新密钥；
-			// 切回时 normalizeVLESS 会按空密钥重生成。
 			if cfg.Mode == "reality" || cfg.Mode == "" {
 				cfg.ShortID = randHexID()[:8]
 				priv, pub, err := genRealityKeypair()
@@ -2427,8 +2399,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			var cfg proxy.TrojanConfig
 			_ = json.Unmarshal([]byte(in.Config), &cfg)
 			cfg.Password = proxy.DefaultTrojan().Password
-			// 同 VLESS：Reality 密钥/ShortID 只有 Reality 档用，
-			// TLS 档（cf/h2/httpupgrade）不带原节点密钥对。
 			if cfg.Mode == "reality" || cfg.Mode == "" {
 				cfg.ShortID = randHexID()[:8]
 				priv, pub, err := genRealityKeypair()
@@ -2464,16 +2434,13 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal([]byte(in.Config), &cfg)
 			fresh := proxy.DefaultNaive()
 			cfg.Username, cfg.Password = fresh.Username, fresh.Password
-			// 证书单独复制一份给新节点（同域名所以证书仍有效）；
-			// 复制失败时清掉引用，启用时 Apply 明说缺证书，
-			// 绝不让新节点指着原节点的文件。
 			if cfg.CertFile != "" && cfg.KeyFile != "" {
 				newCert := filepath.Join(s.app.ConfigDir(), "naive-"+clone.ID+".crt")
 				newKey := filepath.Join(s.app.ConfigDir(), "naive-"+clone.ID+".key")
 				certData, certErr := os.ReadFile(cfg.CertFile)
 				keyData, keyErr := os.ReadFile(cfg.KeyFile)
 				if certErr == nil && keyErr == nil &&
-					os.WriteFile(newCert, certData, 0644) == nil &&
+					os.WriteFile(newCert, certData, 0600) == nil &&
 					os.WriteFile(newKey, keyData, 0600) == nil {
 					cfg.CertFile, cfg.KeyFile = newCert, newKey
 				} else {
@@ -2508,7 +2475,9 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.app.ApplyAll(); err != nil {
-			errJSON(w, 500, "克隆已保存但启动失败："+err.Error())
+			_ = s.app.Store.DeleteInbound(clone.ID)
+			s.resyncAfterRollback()
+			errJSON(w, 500, "克隆启动失败（已撤销创建）："+err.Error())
 			return
 		}
 		link, tme := s.inboundLinks(clone)
@@ -2582,14 +2551,15 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.app.ApplyAll(); err != nil {
-			errJSON(w, 500, "伪装域名已换但启动失败："+err.Error())
+			_ = s.app.Store.UpsertInbound(&oldIn)
+			s.resyncAfterRollback()
+			errJSON(w, 500, "伪装域名未换（已回滚配置）："+err.Error())
 			return
 		}
 		link, tme := s.inboundLinks(in)
 		link6, _ := s.inboundLinks6(in)
 		okJSON(w, map[string]interface{}{"inbound": in, "link": link, "link6": link6, "tme_link": tme, "sni": newSNI})
 	case "cert":
-		// Naive 证书上传：只收 PEM 文本，配对校验通过才落盘。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -2612,8 +2582,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 		}
 		certPath := filepath.Join(s.app.ConfigDir(), "naive-"+in.ID+".crt")
 		keyPath := filepath.Join(s.app.ConfigDir(), "naive-"+in.ID+".key")
-		// 两文件先写临时文件、都成功后再一起重命名：以前先写证书后写私钥，
-		// 私钥写失败时盘上是新证书 + 旧私钥的错配组合，原正常节点直接变坏。
 		tmpCert := certPath + ".tmp"
 		tmpKey := keyPath + ".tmp"
 		if err := os.WriteFile(tmpCert, []byte(body.Cert), 0600); err != nil {
@@ -2636,12 +2604,11 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 500, err.Error())
 			return
 		}
+		oldIn := *in
 		var cfg proxy.NaiveConfig
 		_ = json.Unmarshal([]byte(in.Config), &cfg)
 		cfg.CertFile, cfg.KeyFile = certPath, keyPath
 		in.Config = store.MustJSON(cfg)
-		// 上传证书即启用（按钮文案就是“上传并启动”；手动停用的节点传了证书也会启用，
-		// 这是上传动作本身的语义，不是悄悄改状态）。
 		in.Enabled = true
 		in.UpdatedAt = time.Now().Unix()
 		if err := s.app.Store.UpsertInbound(in); err != nil {
@@ -2649,7 +2616,9 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.app.ApplyAll(); err != nil {
-			errJSON(w, 500, "证书已保存但启动失败："+err.Error())
+			_ = s.app.Store.UpsertInbound(&oldIn)
+			s.resyncAfterRollback()
+			errJSON(w, 500, "证书已保存但启动失败（已回滚配置）："+err.Error())
 			return
 		}
 		link, _ := s.inboundLinks(in)
@@ -2676,7 +2645,6 @@ func (s *Server) handleInboundAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 405, "method")
 			return
 		}
-		// 全部节点都跑在 sing-box 里，看 sing-box 日志。
 		logPath := s.app.Mgr.LogPath("sing-box")
 		b, err := os.ReadFile(logPath)
 		if err != nil {
@@ -2705,8 +2673,9 @@ func (s *Server) handleSNIList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSNIRandom(w http.ResponseWriter, r *http.Request) {
-	ex := r.URL.Query().Get("exclude")
-	okJSON(w, proxy.RecommendSNI(ex))
+	// 支持多个 exclude（?exclude=a&exclude=b），单值照旧兼容。
+	exs := r.URL.Query()["exclude"]
+	okJSON(w, proxy.RecommendSNIExcluding(exs...))
 }
 
 // ---------- bnodes & chains ----------
@@ -2718,9 +2687,6 @@ func (s *Server) handleBNodes(w http.ResponseWriter, r *http.Request) {
 		if list == nil {
 			list = []*store.BNode{}
 		}
-		// 显示名解码：老数据里 SS 节点的名字是粘贴链接时存的 #fragment
-		// 原样（百分号编码），直接显示就是乱码；这里只解码显示，存储
-		// 的链接不动，订阅发给客户端的还是原链接（客户端自己会解码）。
 		out := make([]*store.BNode, 0, len(list))
 		for _, b := range list {
 			cp := *b
@@ -2742,12 +2708,6 @@ func (s *Server) handleBNodes(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 400, err.Error())
 			return
 		}
-		if p.Protocol == "hysteria2" {
-			// hy2 B is supported via sing-box handoff; allowed
-		}
-		// 链接去重：同一条链接（只比 # 之前，名字后缀不算）
-		// 贴两次不再建第二行——重复的 B 节点会让链式下拉、
-		// 订阅和测活都出现双份，还容易把两条当成两个节点。
 		if existing, _ := s.app.Store.ListBNodes(); existing != nil {
 			base := body.Link
 			if i := strings.Index(base, "#"); i >= 0 {
@@ -2764,8 +2724,6 @@ func (s *Server) handleBNodes(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		// 以前 name 字段直接被忽略，存的是链接 #fragment 里的名字，
-		// 前端按 name 回显就会对不上（行为测试 2.6）；显式传了名就用它。
 		bnName := p.Name
 		if body.Name != "" {
 			bnName = body.Name
@@ -2817,9 +2775,6 @@ func (s *Server) handleBNodeAction(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, 500, err.Error())
 				return
 			}
-			// 悬空链式由 DeleteBNode 的事务一并清掉（原子），
-			// 下面必须 ApplyAll：以前删 B 节点不触发 Apply，
-			// 链式出站还残留在 singbox.json 里继续跑。
 			if err := s.app.ApplyAll(); err != nil {
 				errJSON(w, 500, "已删除但重启失败："+err.Error())
 				return
@@ -2833,10 +2788,23 @@ func (s *Server) handleBNodeAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleBNodesLatency：本机 → 每个 B 节点服务器的 TCP 建连延迟，
-// 前端在入站列表页每 3 秒轮询一次，只更新 ping 数字不重绘列表。
-// Hy2 走 UDP，TCP 探活永远不通，所以 Hy2 直接返回 udp、不给假数字；
-// 域名节点测的是解析后的地址，CF 域名测到的是 CF 边缘，属实。
+// isInternalTarget 拦截本机回环、私网、链路本地与未指定地址，防止借延迟探活探测内网端口（SSRF）。
+func isInternalTarget(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return true
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleBNodesLatency(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		errJSON(w, 405, "method")
@@ -2845,8 +2813,8 @@ func (s *Server) handleBNodesLatency(w http.ResponseWriter, r *http.Request) {
 	list, _ := s.app.Store.ListBNodes()
 	type row struct {
 		ID   string `json:"id"`
-		MS   int64  `json:"ms"`   // -1 = 不通/超时；hy2 时无意义，看 Kind
-		Kind string `json:"kind"` // "tcp" | "udp"
+		MS   int64  `json:"ms"`
+		Kind string `json:"kind"`
 	}
 	out := []row{}
 	var mu sync.Mutex
@@ -2865,7 +2833,7 @@ func (s *Server) handleBNodesLatency(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			host, port, err := proxy.BNodeHostPort(b.Link)
-			if err != nil {
+			if err != nil || isInternalTarget(host) {
 				mu.Lock()
 				out = append(out, r)
 				mu.Unlock()
@@ -2886,75 +2854,114 @@ func (s *Server) handleBNodesLatency(w http.ResponseWriter, r *http.Request) {
 	okJSON(w, out)
 }
 
+// validateChainInput 统一校验链式创建与编辑参数：
+// 1. 支持除 WireGuard / dokodemo 外全部 12 种本地协议作为入口 A；
+// 2. 强制单 A 节点唯一绑定一条链式配置，防多链抢同一入站；
+// 3. 支持 direct 全局直通与 split 多节点分流（B1/B2/B3... + 可选未命中兜底 B）；
+// 4. 向下兼容旧版单分流参数（仅传 bnode_id + list）。
+func (s *Server) validateChainInput(excludeChainID, inboundID, mode, bnodeID string, routes []store.ChainRoute, legacyList string) (*store.Inbound, string, string, []store.ChainRoute, error) {
+	if inboundID == "" {
+		return nil, "", "", nil, fmt.Errorf("请选择入口 A 节点")
+	}
+	in, err := s.app.Store.GetInbound(inboundID)
+	if err != nil || !proxy.CanBeChainA(in.Protocol) {
+		return nil, "", "", nil, fmt.Errorf("入口 A 节点不存在或协议不支持链式（支持除 WireGuard、dokodemo 外全部本机节点）")
+	}
+	existing, _ := s.app.Store.ListChains()
+	for _, c := range existing {
+		if c.ID != excludeChainID && c.InboundID == inboundID {
+			return nil, "", "", nil, fmt.Errorf("该 A 节点已有链式规则，一个 A 节点只能有一条链式（多节点分流请在该规则中添加分流组）")
+		}
+	}
+	if mode != "" && mode != "split" && mode != "direct" {
+		return nil, "", "", nil, fmt.Errorf("链式方式不对")
+	}
+	if mode == "direct" {
+		if bnodeID == "" {
+			return nil, "", "", nil, fmt.Errorf("全局直通模式必须选择落地 B 节点")
+		}
+		if _, err := s.app.Store.GetBNode(bnodeID); err != nil {
+			return nil, "", "", nil, fmt.Errorf("B 节点不存在")
+		}
+		return in, "direct", bnodeID, []store.ChainRoute{}, nil
+	}
+
+	// split 多路分流模式（兼容旧调用：未传 routes 时由 bnode_id + list 升格为第 1 组）
+	if len(routes) == 0 && bnodeID != "" && strings.TrimSpace(legacyList) != "" {
+		routes = []store.ChainRoute{{BNodeID: bnodeID, List: legacyList}}
+		bnodeID = ""
+	}
+	if len(routes) == 0 {
+		return nil, "", "", nil, fmt.Errorf("域名或 IP 分流组不能为空")
+	}
+	specs := make([]proxy.ChainRouteSpec, len(routes))
+	for i, r := range routes {
+		if r.BNodeID == "" {
+			return nil, "", "", nil, fmt.Errorf("第 %d 组未选择落地 B 节点", i+1)
+		}
+		if _, err := s.app.Store.GetBNode(r.BNodeID); err != nil {
+			return nil, "", "", nil, fmt.Errorf("第 %d 组的 B 节点不存在", i+1)
+		}
+		specs[i] = proxy.ChainRouteSpec{BNodeID: r.BNodeID, List: r.List}
+	}
+	normLists, err := proxy.ValidateAndNormalizeRoutes(specs)
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	if bnodeID != "" {
+		if _, err := s.app.Store.GetBNode(bnodeID); err != nil {
+			return nil, "", "", nil, fmt.Errorf("默认兜底 B 节点不存在")
+		}
+		for i, r := range routes {
+			if r.BNodeID == bnodeID {
+				return nil, "", "", nil, fmt.Errorf("默认兜底节点与第 %d 组相同：其余流量既然也走该节点，直接删掉第 %d 组即可", i+1, i+1)
+			}
+		}
+	}
+	cleanRoutes := make([]store.ChainRoute, len(routes))
+	for i := range routes {
+		cleanRoutes[i] = store.ChainRoute{BNodeID: routes[i].BNodeID, List: normLists[i]}
+	}
+	return in, "split", bnodeID, cleanRoutes, nil
+}
+
 func (s *Server) handleChains(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
-		list, _ := s.app.Store.ListChains()
+		list, err := s.app.Store.ListChains()
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
 		if list == nil {
 			list = []*store.Chain{}
 		}
 		okJSON(w, list)
 	case "POST":
 		var body struct {
-			Name      string `json:"name"`
-			InboundID string `json:"inbound_id"`
-			List      string `json:"list"`
-			Mode      string `json:"mode"`
-			BNodeID   string `json:"bnode_id"`
+			Name      string             `json:"name"`
+			InboundID string             `json:"inbound_id"`
+			List      string             `json:"list"`
+			Mode      string             `json:"mode"`
+			BNodeID   string             `json:"bnode_id"`
+			Routes    []store.ChainRoute `json:"routes"`
 		}
 		if err := s.readJSON(r, &body); err != nil {
 			errJSON(w, 400, "请求格式不对")
 			return
 		}
-		if body.InboundID == "" || body.BNodeID == "" {
-			errJSON(w, 400, "A 节点和 B 节点都要选")
-			return
-		}
-		in, err := s.app.Store.GetInbound(body.InboundID)
-		if err != nil || in.Protocol != "vless" {
-			errJSON(w, 400, "链式 A 节点必须是本机 VLESS 节点")
-			return
-		}
-		_, err = s.app.Store.GetBNode(body.BNodeID)
+		in, mode, fbBNodeID, cleanRoutes, err := s.validateChainInput("", body.InboundID, body.Mode, body.BNodeID, body.Routes, body.List)
 		if err != nil {
-			errJSON(w, 400, "B 节点不存在")
+			errJSON(w, 400, err.Error())
 			return
 		}
-		mode := body.Mode
-		if mode != "" && mode != "split" && mode != "direct" {
-			errJSON(w, 400, "链式方式不对")
-			return
-		}
-		if mode == "direct" {
-			// 直接链式不用清单：全部流量 A 进 B 出。
-			body.List = ""
-		} else {
-			mode = "split"
-			if strings.TrimSpace(body.List) == "" {
-				errJSON(w, 400, "域名或 IP 清单不能为空")
-				return
-			}
-			// 清单逐行校验 + 归一化：非法行按行号拒绝，scheme/路径/端口/
-			// 前导点全部剥掉再存，存进去的就是实际会匹配的样子。
-			suffixes, cidrs, err := proxy.ParseChainList(body.List)
-			if err != nil {
-				errJSON(w, 400, err.Error())
-				return
-			}
-			body.List = strings.Join(append(append([]string{}, suffixes...), cidrs...), "\n")
-		}
-		// 一个 A 节点只能有一条链式：两条链式抢同一个入站，
-		// 路由会互相覆盖，流量不知道该走哪个 B，索性建的时候就拦住。
-		existing, _ := s.app.Store.ListChains()
-		for _, c := range existing {
-			if c.InboundID == body.InboundID {
-				errJSON(w, 400, "该 A 节点已有链式规则，一个 A 节点只能有一条链式")
-				return
-			}
-		}
-		name := body.Name
+		name := strings.TrimSpace(body.Name)
 		if name == "" {
 			name = "链式-" + in.Name
+		}
+		legacyList := ""
+		if mode == "split" && len(cleanRoutes) == 1 && fbBNodeID == "" {
+			legacyList = cleanRoutes[0].List
 		}
 		ch := &store.Chain{
 			ID: s.uniqueID(func(id string) bool {
@@ -2965,15 +2972,24 @@ func (s *Server) handleChains(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				return false
-			}), Name: name, InboundID: body.InboundID,
-			List: body.List, Mode: mode, BNodeID: body.BNodeID, Enabled: true, CreatedAt: time.Now().Unix(),
+			}),
+			Name:      name,
+			InboundID: body.InboundID,
+			List:      legacyList,
+			Mode:      mode,
+			BNodeID:   fbBNodeID,
+			Routes:    cleanRoutes,
+			Enabled:   true,
+			CreatedAt: time.Now().Unix(),
 		}
 		if err := s.app.Store.UpsertChain(ch); err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
 		if err := s.app.ApplyAll(); err != nil {
-			errJSON(w, 500, "链式已保存但启动失败："+err.Error())
+			_ = s.app.Store.DeleteChain(ch.ID)
+			s.resyncAfterRollback()
+			errJSON(w, 500, "链式启动失败（已撤销创建）："+err.Error())
 			return
 		}
 		okJSON(w, ch)
@@ -2982,7 +2998,6 @@ func (s *Server) handleChains(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// chainLink：链式对外暴露的链接 = A 节点链接、名字换成链名。
 func (s *Server) chainLink(ch *store.Chain) (link, link6 string) {
 	in, err := s.app.Store.GetInbound(ch.InboundID)
 	if err != nil {
@@ -3015,9 +3030,7 @@ func (s *Server) handleChainAction(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 404, "链式不存在")
 		return
 	}
-	// 链式链接：就是 A 节点链接、名字换成链名（和订阅里链式入口同一条）。
-	// 客户端只连 A，链式在服务端 sing-box 里完成，所以不存在另一条
-	// “链式协议”链接；链式链接就是拿着链名的 A 链接。
+	oldCh := *ch
 	if action == "link" || action == "qr" {
 		if r.Method != "GET" {
 			errJSON(w, 405, "method")
@@ -3044,96 +3057,85 @@ func (s *Server) handleChainAction(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "PUT":
 		var body struct {
-			Name      *string `json:"name"`
-			InboundID *string `json:"inbound_id"`
-			List      *string `json:"list"`
-			Mode      *string `json:"mode"`
-			BNodeID   *string `json:"bnode_id"`
-			Enabled   *bool   `json:"enabled"`
+			Name      *string             `json:"name"`
+			InboundID *string             `json:"inbound_id"`
+			List      *string             `json:"list"`
+			Mode      *string             `json:"mode"`
+			BNodeID   *string             `json:"bnode_id"`
+			Routes    *[]store.ChainRoute `json:"routes"`
+			Enabled   *bool               `json:"enabled"`
 		}
 		if err := s.readJSON(r, &body); err != nil {
 			errJSON(w, 400, "请求格式不对")
 			return
 		}
 		if body.Name != nil {
-			// 与节点 PUT 一致：编辑时清空名字没有合理语义，直接拒绝。
 			if strings.TrimSpace(*body.Name) == "" {
 				errJSON(w, 400, "链式名不能为空")
 				return
 			}
-			ch.Name = *body.Name
+			ch.Name = strings.TrimSpace(*body.Name)
 		}
-		if body.InboundID != nil {
-			if *body.InboundID != ch.InboundID {
-				others, _ := s.app.Store.ListChains()
-				for _, c := range others {
-					if c.ID != ch.ID && c.InboundID == *body.InboundID {
-						errJSON(w, 400, "该 A 节点已有链式规则，一个 A 节点只能有一条链式")
-						return
-					}
-				}
-				// PUT 复用创建的 A 节点校验：以前只查一链，不查 A 是否 VLESS。
-				in, err := s.app.Store.GetInbound(*body.InboundID)
-				if err != nil || in.Protocol != "vless" {
-					errJSON(w, 400, "链式 A 节点必须是本机 VLESS 节点")
-					return
-				}
-			}
-			ch.InboundID = *body.InboundID
+		if body.Enabled != nil {
+			ch.Enabled = *body.Enabled
 		}
-		if body.Mode != nil {
-			m := *body.Mode
-			if m != "" && m != "split" && m != "direct" {
-				errJSON(w, 400, "链式方式不对")
-				return
+		// 若本次请求修改了路由结构相关的任意字段，统一跑全量冲突与合法性校验
+		if body.InboundID != nil || body.Mode != nil || body.BNodeID != nil || body.Routes != nil || body.List != nil {
+			inID := ch.InboundID
+			if body.InboundID != nil {
+				inID = *body.InboundID
 			}
-			if m == "direct" {
-				// 切到直接链式：清单直接清掉，不用填。
-				ch.Mode = "direct"
-				ch.List = ""
-			} else {
-				// 切回分流：必须有清单（新传的，或已存的）。
-				if body.List != nil {
-					suffixes, cidrs, err := proxy.ParseChainList(*body.List)
-					if err != nil {
-						errJSON(w, 400, err.Error())
-						return
-					}
-					ch.List = strings.Join(append(append([]string{}, suffixes...), cidrs...), "\n")
-				} else if strings.TrimSpace(ch.List) == "" {
-					errJSON(w, 400, "切回分流要填域名或 IP 清单")
-					return
+			mode := ch.Mode
+			if body.Mode != nil {
+				mode = *body.Mode
+			}
+			bID := ch.BNodeID
+			if body.BNodeID != nil {
+				bID = *body.BNodeID
+			}
+			rts := ch.Routes
+			if body.Routes != nil {
+				rts = *body.Routes
+			} else if body.List != nil && mode != "direct" {
+				// 兼容仅改单路 List/BNodeID 的旧式 PUT 请求
+				targetB := bID
+				if targetB == "" && len(ch.Routes) > 0 {
+					targetB = ch.Routes[0].BNodeID
 				}
-				ch.Mode = "split"
+				rts = []store.ChainRoute{{BNodeID: targetB, List: *body.List}}
+				if body.BNodeID != nil {
+					bID = ""
+				}
 			}
-		} else if body.List != nil && ch.Mode != "direct" {
-			// 原分流链式改清单：复用创建的清单校验 + 归一化。
-			// 直接链式下送来的清单直接忽略（前端在直接模式下不显示清单框）。
-			suffixes, cidrs, err := proxy.ParseChainList(*body.List)
+			legacyList := ch.List
+			if body.List != nil {
+				legacyList = *body.List
+			}
+			_, cleanMode, fbBNodeID, cleanRoutes, err := s.validateChainInput(ch.ID, inID, mode, bID, rts, legacyList)
 			if err != nil {
 				errJSON(w, 400, err.Error())
 				return
 			}
-			ch.List = strings.Join(append(append([]string{}, suffixes...), cidrs...), "\n")
-		}
-		if body.BNodeID != nil {
-			// PUT 复用创建的 B 节点校验：以前只换 id，不查存在。
-			_, err := s.app.Store.GetBNode(*body.BNodeID)
-			if err != nil {
-				errJSON(w, 400, "B 节点不存在")
-				return
+			ch.InboundID = inID
+			ch.Mode = cleanMode
+			ch.BNodeID = fbBNodeID
+			ch.Routes = cleanRoutes
+			if cleanMode == "direct" {
+				ch.List = ""
+			} else if len(cleanRoutes) == 1 && fbBNodeID == "" {
+				ch.List = cleanRoutes[0].List
+			} else {
+				ch.List = ""
 			}
-			ch.BNodeID = *body.BNodeID
-		}
-		if body.Enabled != nil {
-			ch.Enabled = *body.Enabled
 		}
 		if err := s.app.Store.UpsertChain(ch); err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
 		if err := s.app.ApplyAll(); err != nil {
-			errJSON(w, 500, "已保存但启动失败："+err.Error())
+			_ = s.app.Store.UpsertChain(&oldCh)
+			s.resyncAfterRollback()
+			errJSON(w, 500, "修改未生效（已回滚配置）："+err.Error())
 			return
 		}
 		okJSON(w, ch)
@@ -3181,11 +3183,6 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// syncCliCredentials：面板改账号/密码时同步更新 CLI 凭证文件，让改动立即
-// 对 SSH 命令行也生效，不用再跑 sssingbox login。文件不存在时不创建
-// （手动部署本来就没有 CLI 凭证文件，别凭空造一个）；只传了 username
-// 或 password 其中一项时，另一项沿用文件里的旧值；写失败也不影响面板
-// 本身的改动（面板登录以数据库为准，CLI 只是它的一个副本）。
 func (s *Server) syncCliCredentials(username, password string) {
 	path := filepath.Join(s.app.Dir, ".cli-credentials")
 	b, err := os.ReadFile(path)
@@ -3246,10 +3243,8 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, 500, err.Error())
 				return
 			}
-			// 账号改了，CLI 凭证文件里的账号同步跟上，SSH 命令行不用再跑 login。
 			s.syncCliCredentials(body.New, "")
 		}
-		// 当前会话跟上新账号，其他会话吊销（旧账号的会话不能再留着）。
 		if c, err := r.Cookie("sssingbox_session"); err == nil {
 			s.sessMu.Lock()
 			if sess, ok := s.sessions[c.Value]; ok {
@@ -3274,8 +3269,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 400, "请求格式不对")
 			return
 		}
-		// 改密码必须验旧密码：只靠会话凭证不够——管理员离开座位时，
-		// 任何人都能在已登录的面板上把密码换掉。旧密码缺失或不对都拒绝。
 		username, ok := s.sessionUser(r)
 		if !ok || username == "" {
 			errJSON(w, 401, "未登录")
@@ -3307,17 +3300,12 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		// 密码改了，CLI 凭证文件里的密码同步跟上，SSH 命令行不用再跑 login。
 		s.syncCliCredentials(username, body.New)
 		if c, err := r.Cookie("sssingbox_session"); err == nil {
 			s.revokeSessionsExcept(c.Value)
 		}
 		okJSON(w, nil)
 	case "password-local":
-		// 本机改密码（SSH 菜单、安装器菜单用）：只允许本机回环调用，不用验
-		// 旧密码——能连到 127.0.0.1 就等于已经拿到服务器 shell，旧密码没有
-		// 意义。其余与 password 完全一致（长度校验、哈希、CLI 凭证同步、
-		// 吊销其他会话）。Web 面板改密码仍走 password，必须验旧密码。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -3362,8 +3350,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 		}
 		okJSON(w, nil)
 	case "login":
-		// 面板登录一表保存：新账号留空=不改，新密码留空=不改、只输一遍；
-		// 两项都空直接拒绝。老 username/password 接口留着（命令行、安装器在用）。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -3387,7 +3373,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 400, "账号和密码都留空，没有要改的内容")
 			return
 		}
-		// 改密码必须验旧密码（只改账号时不用）：同 /api/settings/password。
 		if body.Password != "" {
 			if body.OldPassword == "" {
 				errJSON(w, 400, "改密码请先输入旧密码")
@@ -3399,7 +3384,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// 先全验过再落盘，避免改完账号才发现密码不合格、改一半。
 		newName := old
 		if body.Username != "" && body.Username != old {
 			if len(body.Username) > 32 || strings.ContainsAny(body.Username, " \t\n") {
@@ -3433,7 +3417,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// CLI 凭证同步：只传改了的那项，另一项沿用文件旧值。
 		u, p := "", ""
 		if newName != old {
 			u = newName
@@ -3453,11 +3436,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 		}
 		okJSON(w, map[string]interface{}{"username": newName})
 	case "port":
-		// 设置页改面板端口：按实际服务管理改对应服务文件 + 重启（重启在
-		// 回包 800ms 后做，浏览器才收得到确认）；只有 systemd 需要
-		// daemon-reload。找不到服务文件时直接报错并给出手动重启命令，
-		// 不再谎称“已写入、待手动重启”（v1.0.1 修：OpenRC 上那个谎言
-		// 让手动重启也永远到不了新端口）。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -3511,8 +3489,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 500, "写服务文件失败："+err.Error())
 			return
 		}
-		// 只有 systemd 需要 daemon-reload（单元被缓存）；OpenRC / procd /
-		// sysvinit 每次启服务都重读脚本，不用重载。
 		if kind == initSystemd {
 			if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
 				okJSON(w, map[string]interface{}{"port": body.Port, "restart_required": true, "note": "daemon-reload 失败：" + strings.TrimSpace(string(out))})
@@ -3528,8 +3504,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 			}()
 		}
 	case "panel-enabled":
-		// SSH 菜单开关面板访问：立即生效，不用重启。关闭后只挡外网，
-		// 订阅与本机回环不受影响，代理照常跑；本机随时能再打开。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -3548,7 +3522,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 		_ = s.app.Store.SetSetting("panel_disabled", val)
 		okJSON(w, map[string]interface{}{"panel_disabled": !body.Enabled})
 	case "panel-path":
-		// 设置页改根路径：立即生效，不用重启（路径门每次请求都读设置）。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -3568,10 +3541,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 		_ = s.app.Store.SetSetting("panel_path", path)
 		okJSON(w, map[string]interface{}{"panel_path": path})
 	case "panel-access":
-		// 设置页“面板访问”一次改端口+路径：老前端先改路径、再改端口，
-		// 第二步请求还带着旧路径前缀，新路径门一挡就是 404（路径改
-		// 成了、端口没改成）。合并成一次请求就没有这个窗口：先把
-		// 两项全验完、再应用；端口要重启才生效，路径立即生效。
 		if r.Method != "POST" {
 			errJSON(w, 405, "method")
 			return
@@ -3614,8 +3583,6 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 		note := ""
 		kind := panelInitKind()
 		if portChanged {
-			// 服务文件找不到/读不出时直接报错，路径也不落盘（两项要么
-			// 都改、要么都不改，不再出现“只改路径、端口丢了还谎称已保存”）。
 			svcFile := panelServiceFile()
 			if svcFile == "" {
 				bin, _ := os.Executable()
@@ -3641,10 +3608,8 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, 500, "写服务文件失败："+err.Error())
 				return
 			}
-			// 只有 systemd 需要 daemon-reload；其他服务管理重读脚本。
 			if kind == initSystemd {
 				if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
-					// 服务文件已写入新端口，手动重启后生效；路径照常立即生效。
 					restartRequired = true
 					note = "daemon-reload 失败：" + strings.TrimSpace(string(out))
 				}
@@ -3738,12 +3703,8 @@ func (s *Server) handleSettingsAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---------- subscription ----------
-
 // ---------- background loops ----------
 
-// quotaThreshold：限额提前 1G 停（1000G 到 999G 停），
-// 限额本身不足 1G 时按 99.9% 停，避免还没跑就超。
 func quotaThreshold(q int64) int64 {
 	if q > 1<<30 {
 		return q - (1 << 30)
@@ -3751,9 +3712,8 @@ func quotaThreshold(q int64) int64 {
 	return q * 999 / 1000
 }
 
-// checkQuota：节点用了超过限额门槛就停用并落盘生效，
-// 只在跨越门槛那一刻做一次（停用后下次循环已跳过）。
-func (s *Server) checkQuota(id string) {
+// checkQuotaLocked 在调用方已持有 s.writeMu 时执行配额检查与停用。
+func (s *Server) checkQuotaLocked(id string) {
 	in, err := s.app.Store.GetInbound(id)
 	if err != nil || !in.Enabled || in.QuotaMode == "" || in.QuotaBytes <= 0 {
 		return
@@ -3771,30 +3731,46 @@ func (s *Server) checkQuota(id string) {
 	}
 	if used >= quotaThreshold(in.QuotaBytes) {
 		in.Enabled = false
-		// 写库失败绝不能继续 Apply：Apply 是按库里状态生成的，
-		// 库没改成就 Apply 等于没停用，超量节点继续跑。
-		// 写库失败本轮跳过，下轮（3 秒后）重算重写，自愈。
 		if err := s.app.Store.UpsertInbound(in); err == nil {
 			_ = s.app.ApplyAll()
 		}
 	}
 }
 
+// checkQuota 供后台轮询协程调用：先无锁快检，仅在达到阈值时加 s.writeMu 二次确认并停用。
+func (s *Server) checkQuota(id string) {
+	in, err := s.app.Store.GetInbound(id)
+	if err != nil || !in.Enabled || in.QuotaMode == "" || in.QuotaBytes <= 0 {
+		return
+	}
+	totals, _ := s.app.Store.TotalTraffic()
+	t, ok := totals[id]
+	if !ok {
+		return
+	}
+	var used int64
+	if in.QuotaMode == "down" {
+		used = t[1]
+	} else {
+		used = t[0] + t[1]
+	}
+	if used < quotaThreshold(in.QuotaBytes) {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.checkQuotaLocked(id)
+}
+
 func (s *Server) StartBackground() {
-	// 面板证书续期：启动即查一次，之后每 6 小时一查（只续 ACME 自动续签的证）。
 	go s.certs.renewalLoop()
-	// 过期会话清理：每小时清一次内存里过期的登录会话（authed 只清遇到的那一条）。
 	go func() {
 		for {
 			time.Sleep(time.Hour)
 			s.sweepExpiredSessions()
 		}
 	}()
-	// traffic accumulation + realtime, every 3s
 	go func() {
-		// addTrafficFailed：记账失败的状态机，只在“成功→失败”
-		// 跃变时打一条日志——每 3 秒打一次会把 panel.log 刷爆，
-		// 完全不打则库一坏、用量静默丢数周。
 		addTrafficFailed := map[string]bool{}
 		addTraffic := func(id string, up, down int64) {
 			if err := s.app.Store.AddTraffic(id, up, down); err != nil {
@@ -3810,24 +3786,25 @@ func (s *Server) StartBackground() {
 		for {
 			time.Sleep(3 * time.Second)
 			tick++
-			// 日志控量：单文件超 10MB 只留最新 2000 行，后台每轮都扫一遍，
-			// 长期不重启的核心也不会把日志堆上天。
 			s.app.Sup.TrimLogs()
 			if s.app.Mgr.Installed("sing-box") && s.app.Sup.Status("sing-box").Running {
-				// nft 规则随节点走：每次轮询同步一次（只增缺失、只删多余），
-				// 重启/手动 flush 后自愈；同步失败时 PollOnce 的错误会报出来。
-				wantPorts := map[int]bool{}
+				wantTCP := map[int]bool{}
+				wantUDP := map[int]bool{}
 				if list, err := s.app.Store.ListInbounds(); err == nil {
 					for _, in := range list {
-						if in.Enabled {
-							wantPorts[in.Port] = true
+						if !in.Enabled {
+							continue
+						}
+						for _, proto := range store.ProtocolTransports(in.Protocol) {
+							if proto == "udp" {
+								wantUDP[in.Port] = true
+							} else {
+								wantTCP[in.Port] = true
+							}
 						}
 					}
 				}
-				// 同步失败也继续 PollOnce：计数器本身不停，少一轮
-				// 规则同步只影响新增/删除的端口；但失败必须留痕，
-				// 不能像以前那样用 _ 丢掉。
-				syncErr := stats.SyncStatsRules(wantPorts)
+				syncErr := stats.SyncStatsRules(wantTCP, wantUDP)
 				deltas, err := s.poller.PollOnce()
 				if err != nil {
 					s.statsMu.Lock()
@@ -3856,8 +3833,6 @@ func (s *Server) StartBackground() {
 					}
 				}
 			}
-			// 全量配额扫（每 10 轮 ≈ 30 秒）：只靠增量触发时，调低限额后
-			// 闲置的节点超限永不生效；全量扫补上这个口子。
 			if tick%10 == 0 {
 				if list, err := s.app.Store.ListInbounds(); err == nil {
 					for _, in := range list {
@@ -3869,7 +3844,6 @@ func (s *Server) StartBackground() {
 			}
 		}
 	}()
-	// core update check, every 12h
 	go func() {
 		for {
 			time.Sleep(12 * time.Hour)

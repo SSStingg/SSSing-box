@@ -324,7 +324,7 @@ func certNeedsRenewal(expiresAt time.Time, now time.Time) bool {
 	if expiresAt.IsZero() {
 		return true
 	}
-	return time.Until(expiresAt) < 30*24*time.Hour
+	return expiresAt.Sub(now) < 30*24*time.Hour
 }
 
 // listCerts：扫描证书目录，只认配齐 fullchain.pem + privkey.pem 且能解析的目录。
@@ -930,29 +930,78 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 // https://域名:端口 能共用一个面板端口，IP 入口不再因“明文打 TLS 端口”而复位。
 type dualListener struct {
 	net.Listener
-	tlsCfg *tls.Config
+	tlsCfg    *tls.Config
+	ready     chan net.Conn
+	errCh     chan error
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
-func (l *dualListener) Accept() (net.Conn, error) {
+func newDualListener(ln net.Listener, tlsCfg *tls.Config) *dualListener {
+	dl := &dualListener{
+		Listener: ln,
+		tlsCfg:   tlsCfg,
+		ready:    make(chan net.Conn, 64),
+		errCh:    make(chan error, 1),
+		done:     make(chan struct{}),
+	}
+	go dl.loop()
+	return dl
+}
+
+func (l *dualListener) loop() {
+	sem := make(chan struct{}, 64) // 最多 64 个并发未首包连接，防资源耗尽
 	for {
 		raw, err := l.Listener.Accept()
 		if err != nil {
-			return nil, err
+			select {
+			case l.errCh <- err:
+			default:
+			}
+			return
 		}
-		// 只偷看 1 字节：连上不发数据的客户端 5 秒后断开，不占 Accept 槽位。
-		_ = raw.SetReadDeadline(time.Now().Add(5 * time.Second))
-		one := make([]byte, 1)
-		if _, err := io.ReadFull(raw, one); err != nil {
-			raw.Close()
-			continue
+		select {
+		case sem <- struct{}{}:
+			go func(c net.Conn) {
+				defer func() { <-sem }()
+				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				one := make([]byte, 1)
+				if _, err := io.ReadFull(c, one); err != nil {
+					_ = c.Close()
+					return
+				}
+				_ = c.SetReadDeadline(time.Time{})
+				pc := &peekedConn{Conn: c, peeked: one}
+				var out net.Conn = pc
+				if one[0] == 0x16 {
+					out = tls.Server(pc, l.tlsCfg)
+				}
+				select {
+				case l.ready <- out:
+				case <-l.done:
+					_ = out.Close()
+				}
+			}(raw)
+		default:
+			_ = raw.Close()
 		}
-		_ = raw.SetReadDeadline(time.Time{})
-		pc := &peekedConn{Conn: raw, peeked: one}
-		if one[0] == 0x16 {
-			return tls.Server(pc, l.tlsCfg), nil
-		}
-		return pc, nil
 	}
+}
+
+func (l *dualListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.ready:
+		return c, nil
+	case err := <-l.errCh:
+		return nil, err
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *dualListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
 }
 
 func (s *Server) Serve(addr string, handler http.Handler) error {
@@ -998,10 +1047,10 @@ func (s *Server) Serve(addr string, handler http.Handler) error {
 				s.fireFirstListen()
 			}
 			log.Printf("面板监听 %s（HTTPS + HTTP 同端口，证书 %s）", addr, dirName)
-			err = srv.Serve(&dualListener{Listener: ln, tlsCfg: &tls.Config{
+			err = srv.Serve(newDualListener(ln, &tls.Config{
 				Certificates: []tls.Certificate{cert},
 				MinVersion:   tls.VersionTLS12,
-			}})
+			}))
 		} else {
 			s.serveMu.Lock()
 			s.servingTLS, s.servingCert = false, ""

@@ -6,6 +6,7 @@
 #   （bash 也一样；脚本是 POSIX sh，dash / busybox ash 都能跑，OpenWrt 不用装 bash）
 # 自定义（环境变量写在 sh 前面，不设则账号密码都随机生成）：
 #   curl -fsSL https://raw.githubusercontent.com/SSStingg/SSSing-box/main/install.sh | SSSINGBOX_USER=xxxx SSSINGBOX_PASS=xxxx SSSINGBOX_PORT=18081 sh
+# 私仓（Forgejo 私有仓库）：设 SSSINGBOX_TOKEN（只读 token 即可），并用 SSSINGBOX_REPO 指到私仓；取 install.sh 本身也要带 Authorization 头。
 # 本地安装包模式：
 #   sh install.sh --from-file sssingbox-linux-amd64.tar.gz [--port 18081] [--data-dir /var/lib/sssingbox]
 #   安装包是 tar.gz，根目录含一个 sssingbox 二进制。
@@ -36,18 +37,36 @@ LOG_HINT=""
 # ---------- 下载与 HTTP（curl 优先，wget 兜底） ----------
 dl() {
 	# dl URL OUT：下载文件，失败返回非 0（调用方在 if 里或直接调用，set -e 下失败即停，与旧版 curl -fsSL 行为一致）
+	# 私仓：设 SSSINGBOX_TOKEN 后自动带 Authorization 头（只读 token 即可）。
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL -o "$2" "$1"
+		if [ -n "${SSSINGBOX_TOKEN:-}" ]; then
+			curl -fsSL -H "Authorization: token $SSSINGBOX_TOKEN" -o "$2" "$1"
+		else
+			curl -fsSL -o "$2" "$1"
+		fi
 	else
-		wget -q -O "$2" "$1"
+		if [ -n "${SSSINGBOX_TOKEN:-}" ]; then
+			wget -q --header="Authorization: token $SSSINGBOX_TOKEN" -O "$2" "$1"
+		else
+			wget -q -O "$2" "$1"
+		fi
 	fi
 }
 dl_out() {
 	# dl_out URL：打到 stdout，失败返回非 0，调用方自行用 || true 处理
+	# 私仓：设 SSSINGBOX_TOKEN 后自动带 Authorization 头（只读 token 即可）。
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL "$1"
+		if [ -n "${SSSINGBOX_TOKEN:-}" ]; then
+			curl -fsSL -H "Authorization: token $SSSINGBOX_TOKEN" "$1"
+		else
+			curl -fsSL "$1"
+		fi
 	else
-		wget -qO- "$1"
+		if [ -n "${SSSINGBOX_TOKEN:-}" ]; then
+			wget -q --header="Authorization: token $SSSINGBOX_TOKEN" -O- "$1"
+		else
+			wget -qO- "$1"
+		fi
 	fi
 }
 http_post() {
@@ -427,9 +446,13 @@ if [ -n "$UNINSTALL" ]; then
 	# 两处服务文件都清（防止换过服务管理器的残留）
 	rm -f "/etc/systemd/system/$SERVICE.service" "/etc/init.d/$SERVICE"
 	if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload 2>/dev/null || true; fi
-	# 面板自有 nft 表（端口跳跃用）随卸载清掉，不留孤儿转发规则；
+	# 面板自有 nft 表（端口跳跃表与流量统计表）随卸载清掉，不留孤儿规则；
 	# Guijia/Docker 等其他表一律不动。
-	nft delete table inet sssingbox-hop 2>/dev/null || true
+	if command -v nft >/dev/null 2>&1; then
+		for tbl in $(nft list tables inet 2>/dev/null | awk '/^table inet sssingbox-/{print $3}'); do
+			nft delete table inet "$tbl" 2>/dev/null || true
+		done
+	fi
 	rm -f "$BIN_PATH" "/usr/bin/$SERVICE"
 	echo "已卸载。数据目录 $DATA_DIR 已保留，彻底删除请执行：rm -rf $DATA_DIR"
 	exit 0
@@ -551,11 +574,13 @@ if [ "$INIT" = "none" ]; then
 	echo "提示：未检测到服务管理器（容器 / 无 init 环境），面板已以后台方式启动；重启后不会自动启动，如需开机自启请把启动命令加入容器启动配置。"
 fi
 echo "等待面板端口就绪..."
-for i in $(seq 1 30); do
+i=0
+while [ "$i" -lt 30 ]; do
 	if http_ok "http://127.0.0.1:$PORT/"; then
 		break
 	fi
 	sleep 1
+	i=$((i+1))
 	if [ "$i" = "30" ]; then
 		echo "警告：面板 30 秒还没响应 HTTP，但服务已在运行，请稍后打开面板或看日志：$LOG_HINT"
 	fi
@@ -580,8 +605,7 @@ SETUP_OUT="$(http_post "http://127.0.0.1:$PORT/api/setup" "{\"username\":\"$(jso
 SETUP_OK=0
 SETUP_STATUS="exists"
 if echo "$SETUP_OUT" | grep -q '"ok":true'; then
-	printf '{"username":"%s","password":"%s"}' "$USER_NAME" "$PASS" > "$DATA_DIR/.cli-credentials"
-	chmod 600 "$DATA_DIR/.cli-credentials"
+	(umask 077 && printf '{"username":"%s","password":"%s"}' "$(json_escape "$USER_NAME")" "$(json_escape "$PASS")" > "$DATA_DIR/.cli-credentials")
 	SETUP_OK=1
 	SETUP_STATUS="ok"
 elif [ -z "$SETUP_OUT" ]; then
@@ -592,8 +616,11 @@ else
 fi
 
 # 防火墙放行（尽力而为，失败不中断安装）
-if command -v ufw >/dev/null 2>&1; then ufw allow "$PORT/tcp" >/dev/null 2>&1 || true; fi
-if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --add-port="$PORT/tcp" >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true; fi
+fw_allow_port() {
+	if command -v ufw >/dev/null 2>&1; then ufw allow "$1/tcp" >/dev/null 2>&1 || true; fi
+	if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --add-port="$1/tcp" >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true; fi
+}
+fw_allow_port "$PORT"
 
 IP=""
 if command -v curl >/dev/null 2>&1; then IP="$(curl -s --max-time 5 ifconfig.me || true)"; else IP="$(wget -qO- -T 5 ifconfig.me 2>/dev/null || true)"; fi
@@ -710,6 +737,7 @@ if [ "$SETUP_OK" = "1" ] && (head -c 0 < /dev/tty) 2>/dev/null; then
 					if [ "$NEW_PORT" = "$PORT" ]; then echo "和当前端口一样，不用改"; continue; fi
 					if post_jar "http://127.0.0.1:$PORT/api/settings/panel-access" "{\"port\":$NEW_PORT,\"path\":\"$(json_escape "$PANEL_PATH")\"}" "$JAR" send | grep -q '"ok":true'; then
 						PORT="$NEW_PORT"
+						fw_allow_port "$PORT"
 						if [ -n "$PANEL_PATH" ]; then PANEL_URL="http://$IP:$PORT/$PANEL_PATH/"; else PANEL_URL="http://$IP:$PORT/"; fi
 						echo "面板端口已改为 $PORT，正在等面板在新端口上起来…"
 						# 面板改端口后会重启，会话失效；等新端口起来后重新登录，菜单不断线。
@@ -794,6 +822,7 @@ if [ "$SETUP_OK" = "1" ] && (head -c 0 < /dev/tty) 2>/dev/null; then
 					if [ "$PORT_CHANGED" = "1" ] || [ "$NEW_PATH" != "$PANEL_PATH" ]; then
 						if post_jar "http://127.0.0.1:$PORT/api/settings/panel-access" "{\"port\":$NEW_PORT,\"path\":\"$(json_escape "$NEW_PATH")\"}" "$JAR" send | grep -q '"ok":true'; then
 							PORT="$NEW_PORT"; PANEL_PATH="$NEW_PATH"
+							fw_allow_port "$PORT"
 							if [ -n "$PANEL_PATH" ]; then PANEL_URL="http://$IP:$PORT/$PANEL_PATH/"; else PANEL_URL="http://$IP:$PORT/"; fi
 							if [ "$PORT_CHANGED" = "1" ]; then
 								echo "面板端口已改为 $PORT，正在等面板在新端口上起来…"

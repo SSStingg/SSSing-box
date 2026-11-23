@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/SSStingg/SSSing-box/main/install.sh
 
 VLESS、Hysteria2、VMess、Shadowsocks、SOCKS5、HTTP、Trojan、WireGuard、TUIC、AnyTLS、Naive、Snell、ShadowTLS（含 Reality / WS / H2 / HTTPUpgrade / CF 等搭建方式）。
 
-订阅分三种格式：默认链接列表，`?format=singbox` 给 Hiddify / sing-box / Karing 的 JSON，`?format=clash` 给 mihomo 的 YAML；ShadowTLS 只在 JSON 与 YAML 里，WireGuard 没有单行链接。
+订阅分三种格式：默认链接列表，`?format=singbox` 给 Hiddify / sing-box / Karing 的 JSON，`?format=clash` 给 mihomo 的 YAML；ShadowTLS 也有单行 shadowtls:// 链接（可直接粘贴到另一台面板做 B 节点），WireGuard 仅在 Sing-box JSON 与 Clash YAML 中下发。
 
 ## SSH 菜单
 

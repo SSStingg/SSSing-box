@@ -77,11 +77,13 @@ func TestSingBoxFullConfig(t *testing.T) {
 		{"socks", bSocks, "chain-5"},
 		{"hysteria2", bHy2, "chain-6"},
 	} {
-		ob, err := SingBoxBOutbound(tc.proto, tc.cfg, tc.tag)
+		obs, err := SingBoxBOutbound(tc.proto, tc.cfg, tc.tag)
 		if err != nil {
 			t.Fatalf("B 出站转换失败 %s：%v", tc.tag, err)
 		}
-		outbounds = append(outbounds, ob)
+		for _, ob := range obs {
+			outbounds = append(outbounds, ob)
+		}
 	}
 
 	rules := SingBoxChainRules([]ChainInput{

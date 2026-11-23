@@ -1,8 +1,9 @@
 package proxy
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -91,12 +93,14 @@ func Hy2Link(address string, port int, sni string, cfg Hy2Config, name string) s
 	if _, _, err := ParseHopPorts(cfg.HopPorts); err == nil {
 		v += "&mport=" + qesc(cfg.HopPorts) + "&ports=" + qesc(cfg.HopPorts)
 	}
-	return fmt.Sprintf("hysteria2://%s@%s?%s#%s", qesc(cfg.Password), hostPort(address, port), v, qesc(name))
+	return fmt.Sprintf("hysteria2://%s@%s?%s#%s", qesc(cfg.Password), hostPort(address, port), v, url.PathEscape(name))
 }
 
 // GenSelfSignedCert creates a self-signed cert/key pair (for hy2).
+// ECDSA P-256：和 ACME 证书同算法，低配小鸡上生成快、握手包小，
+// 现代客户端全支持。RSA 2048 已退役（生成慢、握手包大）。
 func GenSelfSignedCert(certPath, keyPath, commonName string) error {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
 	}
@@ -106,7 +110,7 @@ func GenSelfSignedCert(certPath, keyPath, commonName string) error {
 		Subject:      pkix.Name{CommonName: commonName},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:     x509.KeyUsageDigitalSignature, // ECDSA 没有 KeyEncipherment（那是 RSA 的）
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{commonName},
 	}
@@ -130,7 +134,11 @@ func GenSelfSignedCert(certPath, keyPath, commonName string) error {
 	if err != nil {
 		return err
 	}
-	_ = pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	ecDer, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+	_ = pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: ecDer})
 	keyOut.Close()
 	// verify pair loads
 	_, err = tls.LoadX509KeyPair(certPath, keyPath)

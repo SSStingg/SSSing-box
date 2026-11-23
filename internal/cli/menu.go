@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sssingbox/internal/proxy"
 )
 
 var stdin = bufio.NewReader(os.Stdin)
@@ -110,7 +112,7 @@ func runMenu(o options) int {
 		case "10":
 			menuChangePassword(c)
 		case "11":
-			c = menuChangePort(c, o)
+			c, o.port = menuChangePort(c, o)
 		case "12":
 			menuAdminResetItem(c, o)
 		case "13":
@@ -225,8 +227,12 @@ func menuStatus(c *client) {
 			on++
 		}
 	}
-	fmt.Printf("面板版本：%v\n面板地址：http://%v:%v/\n节点：%d 个（启用 %d 个）\n",
-		st["version"], st["public_ip"], st["panel_port"], len(nodes), on)
+	host := fmt.Sprintf("%v", st["public_ip"])
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	fmt.Printf("面板版本：%v\n面板地址：http://%s:%v/%s\n节点：%d 个（启用 %d 个）\n",
+		st["version"], host, st["panel_port"], panelPathSuffix(st), len(nodes), on)
 }
 
 func menuSub(c *client) {
@@ -486,22 +492,22 @@ func changePanelPort(c *client, newPort int, curPath string) (map[string]interfa
 // menuChangePort：菜单里改面板端口。走服务端 panel-access 接口：服务端按
 // 实际服务管理类型（systemd/OpenRC/procd/sysvinit）改服务文件、重启面板。
 // 以前菜单自己改 /etc/systemd/system/sssingbox.service，在非 systemd 机器
-// 上直接报“没找到 systemd 服务文件”失败（v1.0.5 修，服务端接口自 v1.0.1
+// 上直接报“没找到 systemd 服务文件”失败（已修，服务端接口自 v1.0.1
 // 起已覆盖全部服务管理类型，install.sh 改端口早已走同一接口）。
-func menuChangePort(c *client, o options) *client {
+func menuChangePort(c *client, o options) (*client, int) {
 	fmt.Printf("当前面板端口：%d\n", o.port)
 	n := promptInt("新端口（0 取消）：", 0)
 	if n == 0 {
 		fmt.Println("已取消")
-		return c
+		return c, o.port
 	}
 	if n < 1 || n > 65535 {
 		fmt.Println("端口范围 1-65535")
-		return c
+		return c, o.port
 	}
 	if n == o.port {
 		fmt.Println("和当前端口一样，不用改")
-		return c
+		return c, o.port
 	}
 	// 当前路径一起提交：服务端一次改端口+路径，避免两步改的 404 窗口。
 	// settings 里必须有 panel_path 这一项才敢提交，缺项时宁可不改，也
@@ -509,18 +515,18 @@ func menuChangePort(c *client, o options) *client {
 	st, err := c.settings()
 	if err != nil {
 		fmt.Println("读当前设置失败：", err)
-		return c
+		return c, o.port
 	}
 	v, ok := st["panel_path"]
 	if !ok {
 		fmt.Println("读当前设置失败：设置里没有 panel_path，没改")
-		return c
+		return c, o.port
 	}
 	curPath, _ := v.(string)
 	resp, err := changePanelPort(c, n, curPath)
 	if err != nil {
 		fmt.Println("修改失败：", err)
-		return c
+		return c, o.port
 	}
 	if rr, _ := resp["restart_required"].(bool); rr {
 		// 服务文件已写入新端口，但面板没自动重启（daemon-reload 失败等）。
@@ -528,7 +534,7 @@ func menuChangePort(c *client, o options) *client {
 			fmt.Println(note)
 		}
 		fmt.Printf("面板端口已写入 %d，面板仍在旧端口运行，重启面板后生效\n", n)
-		return c
+		return c, o.port
 	}
 	// 等新端口起来再重连，最多 30 秒。
 	up := false
@@ -543,15 +549,15 @@ func menuChangePort(c *client, o options) *client {
 	}
 	if !up {
 		fmt.Printf("面板端口已改为 %d，但 30 秒还没探到新端口，请手动确认服务状态\n", n)
-		return c
+		return c, o.port
 	}
 	nc, err := newClient(options{dataDir: o.dataDir, port: n})
 	if err != nil {
 		fmt.Printf("面板端口已改为 %d，但菜单重连失败（%v），请退出后重进菜单\n", n, err)
-		return c
+		return c, o.port
 	}
 	fmt.Printf("面板端口已改为 %d，菜单已切到新端口\n", n)
-	return nc
+	return nc, n
 }
 
 // menuAdminResetItem：菜单里重置管理员密码（忘密码时用）。直接写库，
@@ -581,6 +587,8 @@ var protocols = []struct {
 	{"tuic", "TUIC"},
 	{"anytls", "AnyTLS"},
 	{"naive", "Naive"},
+	{"snell", "Snell"},
+	{"shadowtls", "ShadowTLS"},
 }
 
 func menuCreate(c *client) {
@@ -679,6 +687,56 @@ func menuCreate(c *client) {
 			return
 		}
 		adv = map[string]interface{}{"method": method}
+	case "snell":
+		fmt.Println("版本：1. v5（默认）  2. v6")
+		v := prompt("请选择（默认 1）：")
+		ver := 5
+		if v == "2" {
+			ver = 6
+		} else if v != "" && v != "1" {
+			fmt.Println("没有这个选项")
+			return
+		}
+		if ver == 5 {
+			fmt.Println("混淆：1. http（默认）  2. none")
+			ob := prompt("请选择（默认 1）：")
+			obfsMode := "http"
+			if ob == "2" {
+				obfsMode = "none"
+			} else if ob != "" && ob != "1" {
+				fmt.Println("没有这个选项")
+				return
+			}
+			obfsHost := ""
+			if obfsMode == "http" {
+				// 留空 = 随机推荐一个 SNI 池 Host（bing.com 永不入选）。
+				sugg := proxy.RandomSnellObfsHost()
+				obfsHost = prompt("混淆 Host（留空随机推荐 " + sugg + "）：")
+				if obfsHost == "" {
+					obfsHost = sugg
+				}
+			}
+			adv = map[string]interface{}{"version": 5, "obfs_mode": obfsMode, "obfs_host": obfsHost}
+		} else {
+			fmt.Println("流量整形：1. default（默认）  2. unshaped  3. unsafe-raw")
+			sm := prompt("请选择（默认 1）：")
+			mode := map[string]string{"": "default", "1": "default", "2": "unshaped", "3": "unsafe-raw"}[sm]
+			if mode == "" {
+				fmt.Println("没有这个选项")
+				return
+			}
+			adv = map[string]interface{}{"version": 6, "mode": mode}
+		}
+	case "shadowtls":
+		hs := prompt("握手站域名（默认 gateway.icloud.com，输入 random 随机推荐）：")
+		if hs == "random" {
+			// 默认站本身和 bing.com 都不入选。
+			hs = proxy.RandomHandshakeHost()
+			fmt.Println("随机推荐握手站：", hs)
+		}
+		if hs != "" {
+			adv = map[string]interface{}{"handshake": hs}
+		}
 	}
 	data, err := c.call("POST", "/api/inbounds", createPayload(proto, port, name, sni, adv))
 	if err != nil {

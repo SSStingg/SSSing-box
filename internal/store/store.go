@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, pass_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS inbounds(id TEXT PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL, port INTEGER NOT NULL, address TEXT NOT NULL, sni TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, quota_mode TEXT NOT NULL DEFAULT '', quota_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS bnodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL, link TEXT NOT NULL, config TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS chains(id TEXT PRIMARY KEY, name TEXT NOT NULL, inbound_id TEXT NOT NULL, list TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL DEFAULT '', bnode_id TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS chains(id TEXT PRIMARY KEY, name TEXT NOT NULL, inbound_id TEXT NOT NULL, list TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL DEFAULT '', bnode_id TEXT NOT NULL, routes TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS traffic_total(inbound_id TEXT PRIMARY KEY, up INTEGER NOT NULL DEFAULT 0, down INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS traffic_daily(date TEXT NOT NULL, inbound_id TEXT NOT NULL, up INTEGER NOT NULL DEFAULT 0, down INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(date, inbound_id));
 CREATE TABLE IF NOT EXISTS cores(name TEXT PRIMARY KEY, version TEXT NOT NULL DEFAULT '', installed INTEGER NOT NULL DEFAULT 0, latest TEXT NOT NULL DEFAULT '', last_check INTEGER NOT NULL DEFAULT 0);
@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_daily_date ON traffic_daily(date);
 			return err
 		}
 	}
-	// 老库升级：chains 表建于 mode 字段之前时，补一列（空 = 分流，老链式行为不变）。
+	// 老库升级：chains 表补 mode 列与多路分流 routes 列。
 	rows2, err := s.db.Query("PRAGMA table_info(chains)")
 	if err != nil {
 		return err
@@ -91,6 +91,11 @@ CREATE INDEX IF NOT EXISTS idx_daily_date ON traffic_daily(date);
 	rows2.Close()
 	if !chainCols["mode"] {
 		if _, err := s.db.Exec("ALTER TABLE chains ADD COLUMN mode TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	if !chainCols["routes"] {
+		if _, err := s.db.Exec("ALTER TABLE chains ADD COLUMN routes TEXT NOT NULL DEFAULT '[]'"); err != nil {
 			return err
 		}
 	}
@@ -178,7 +183,7 @@ func (s *Store) ListUsers() []string {
 type Inbound struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
-	Protocol   string `json:"protocol"` // vless | hy2 | vmess
+	Protocol   string `json:"protocol"`
 	Port       int    `json:"port"`
 	Address    string `json:"address"`
 	SNI        string `json:"sni"`
@@ -202,10 +207,6 @@ func (s *Store) UpsertInbound(in *Inbound) error {
 }
 
 func (s *Store) DeleteInbound(id string) error {
-	// 四删放同一事务：以前分开执行、后两条错误被丢弃，节点行已删、
-	// 流量行残留会出现无主节点的孤儿流量；链式以前在 handler 里
-	// 事后删、失败也是静默丢弃，孤儿链只能靠 Apply 兜底——现在
-	// 链式也进事务，删节点要么全清、要么全留。
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -258,14 +259,40 @@ func (s *Store) ListInbounds() ([]*Inbound, error) {
 }
 
 // UDPOnlyProtocol：只走 UDP 的协议。TCP 与 UDP 端口是两套独立编号，
-// 这类协议只跟同样走 UDP 的节点抢端口（2026-11-12：面板里 TCP 节点
-// 也会拦住同端口的 UDP 节点，同一类问题）。
+// 这类协议只跟同样走 UDP 的节点抢端口。
 func UDPOnlyProtocol(protocol string) bool {
 	return protocol == "hy2" || protocol == "tuic" || protocol == "wireguard"
 }
 
+// ProtocolTransports：某协议的流量实际走哪些传输层（决定流量统计的 nft 规则）。
+// Snell 看似 UDP 协议，实则控制与数据都走 TCP（监听 socket 是 TCP，
+// 2026-11-23 实测：3MB 经 TEST-Snell 下行，udp dport 8449 计数纹丝不动），
+// 所以 Snell 归 TCP；只有 hy2/tuic/wireguard 是纯 UDP；ss 是 TCP+UDP 双份。
+func ProtocolTransports(protocol string) []string {
+	switch protocol {
+	case "hy2", "tuic", "wireguard":
+		return []string{"udp"}
+	case "ss":
+		return []string{"tcp", "udp"}
+	default:
+		return []string{"tcp"}
+	}
+}
+
+// ProtocolsShareTransport 判断两种协议是否共用同一传输层（TCP 或 UDP）。
+// 例如 ss 同时监听 TCP+UDP，因此会同时与纯 TCP 和纯 UDP 协议冲突。
+func ProtocolsShareTransport(a, b string) bool {
+	for _, ta := range ProtocolTransports(a) {
+		for _, tb := range ProtocolTransports(b) {
+			if ta == tb {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *Store) PortInUse(port int, protocol string, excludeID string) bool {
-	// TCP 与 UDP 端口是两套编号：只拦同一种传输的节点。
 	rows, err := s.db.Query("SELECT protocol FROM inbounds WHERE port=? AND id!=?", port, excludeID)
 	if err != nil {
 		return false
@@ -273,7 +300,7 @@ func (s *Store) PortInUse(port int, protocol string, excludeID string) bool {
 	defer rows.Close()
 	for rows.Next() {
 		var p string
-		if err := rows.Scan(&p); err == nil && UDPOnlyProtocol(p) == UDPOnlyProtocol(protocol) {
+		if err := rows.Scan(&p); err == nil && ProtocolsShareTransport(p, protocol) {
 			return true
 		}
 	}
@@ -299,8 +326,14 @@ func (s *Store) UpsertBNode(b *BNode) error {
 }
 
 func (s *Store) DeleteBNode(id string) error {
-	// B 节点与挂它的链式同一事务：以前 handler 事后删链、失败
-	// 静默丢弃，孤儿链只能靠 Apply 兜底。
+	// B 节点与挂它的链式同一事务：
+	// - 全局直通链若指向该 B，整条链删除；
+	// - 多路分流链若某个分流组指向该 B，移除该组；若兜底指向该 B，兜底退回直连；
+	//   若移除后整条分流链既无剩余分流组也无兜底 B，则整条链一并删除。
+	chains, err := s.ListChains()
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -309,8 +342,44 @@ func (s *Store) DeleteBNode(id string) error {
 	if _, err := tx.Exec("DELETE FROM bnodes WHERE id=?", id); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("DELETE FROM chains WHERE bnode_id=?", id); err != nil {
-		return err
+	for _, c := range chains {
+		if c.Mode == "direct" {
+			if c.BNodeID == id {
+				if _, err := tx.Exec("DELETE FROM chains WHERE id=?", c.ID); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		changed := false
+		if c.BNodeID == id {
+			c.BNodeID = ""
+			changed = true
+		}
+		kept := make([]ChainRoute, 0, len(c.Routes))
+		for _, r := range c.Routes {
+			if r.BNodeID == id {
+				changed = true
+				continue
+			}
+			kept = append(kept, r)
+		}
+		if changed {
+			if len(kept) == 0 && c.BNodeID == "" {
+				if _, err := tx.Exec("DELETE FROM chains WHERE id=?", c.ID); err != nil {
+					return err
+				}
+			} else if len(kept) == 0 && c.BNodeID != "" {
+				if _, err := tx.Exec("UPDATE chains SET mode='direct', routes='[]', list='' WHERE id=?", c.ID); err != nil {
+					return err
+				}
+			} else {
+				rb, _ := json.Marshal(kept)
+				if _, err := tx.Exec("UPDATE chains SET bnode_id=?, routes=?, list='' WHERE id=?", c.BNodeID, string(rb), c.ID); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return tx.Commit()
 }
@@ -344,15 +413,22 @@ func (s *Store) ListBNodes() ([]*BNode, error) {
 
 // ---- chains ----
 
+// ChainRoute 表示多路分流中的一组“指定域名/IP -> 指定 B 节点”。
+type ChainRoute struct {
+	BNodeID string `json:"bnode_id"`
+	List    string `json:"list"` // 一行一个域名/IP/CIDR
+}
+
 type Chain struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	InboundID string `json:"inbound_id"`
-	List      string `json:"list"` // one domain/IP/CIDR per line (split mode only)
-	Mode      string `json:"mode"` // "direct" = all traffic A->B; "" or "split" = only listed domains/IPs
-	BNodeID   string `json:"bnode_id"`
-	Enabled   bool   `json:"enabled"`
-	CreatedAt int64  `json:"created_at"`
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	InboundID string       `json:"inbound_id"`
+	List      string       `json:"list"`     // 兼容旧版单路分流清单
+	Mode      string       `json:"mode"`     // "direct" = 全局直通走 BNodeID; "" 或 "split" = 多路分流
+	BNodeID   string       `json:"bnode_id"` // direct 模式的落地 B 节点；split 模式的未命中兜底 B 节点（空 = 本机直连）
+	Routes    []ChainRoute `json:"routes"`   // split 模式下的多路分流组（B1 / B2 / B3 ...）
+	Enabled   bool         `json:"enabled"`
+	CreatedAt int64        `json:"created_at"`
 }
 
 func (s *Store) UpsertChain(c *Chain) error {
@@ -360,9 +436,14 @@ func (s *Store) UpsertChain(c *Chain) error {
 	if c.Enabled {
 		en = 1
 	}
-	_, err := s.db.Exec(`INSERT INTO chains(id,name,inbound_id,list,mode,bnode_id,enabled,created_at) VALUES(?,?,?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET name=excluded.name,inbound_id=excluded.inbound_id,list=excluded.list,mode=excluded.mode,bnode_id=excluded.bnode_id,enabled=excluded.enabled`,
-		c.ID, c.Name, c.InboundID, c.List, c.Mode, c.BNodeID, en, c.CreatedAt)
+	routesJSON := "[]"
+	if len(c.Routes) > 0 {
+		b, _ := json.Marshal(c.Routes)
+		routesJSON = string(b)
+	}
+	_, err := s.db.Exec(`INSERT INTO chains(id,name,inbound_id,list,mode,bnode_id,routes,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET name=excluded.name,inbound_id=excluded.inbound_id,list=excluded.list,mode=excluded.mode,bnode_id=excluded.bnode_id,routes=excluded.routes,enabled=excluded.enabled`,
+		c.ID, c.Name, c.InboundID, c.List, c.Mode, c.BNodeID, routesJSON, en, c.CreatedAt)
 	return err
 }
 
@@ -372,7 +453,7 @@ func (s *Store) DeleteChain(id string) error {
 }
 
 func (s *Store) ListChains() ([]*Chain, error) {
-	rows, err := s.db.Query("SELECT id,name,inbound_id,list,mode,bnode_id,enabled,created_at FROM chains ORDER BY created_at ASC")
+	rows, err := s.db.Query("SELECT id,name,inbound_id,list,mode,bnode_id,routes,enabled,created_at FROM chains ORDER BY created_at ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -381,10 +462,24 @@ func (s *Store) ListChains() ([]*Chain, error) {
 	for rows.Next() {
 		var c Chain
 		var en int
-		if err := rows.Scan(&c.ID, &c.Name, &c.InboundID, &c.List, &c.Mode, &c.BNodeID, &en, &c.CreatedAt); err != nil {
+		var routesRaw string
+		if err := rows.Scan(&c.ID, &c.Name, &c.InboundID, &c.List, &c.Mode, &c.BNodeID, &routesRaw, &en, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		c.Enabled = en == 1
+		if routesRaw != "" {
+			if err := json.Unmarshal([]byte(routesRaw), &c.Routes); err != nil {
+				return nil, fmt.Errorf("链式 %s（%s）的分流配置已损坏：%w", c.Name, c.ID, err)
+			}
+		}
+		// 向下兼容：老库单路 split 链尚无 routes 数组时，自动升格为第 1 个分流组，兜底为本机直连。
+		if c.Mode != "direct" && len(c.Routes) == 0 && c.BNodeID != "" && c.List != "" {
+			c.Routes = []ChainRoute{{BNodeID: c.BNodeID, List: c.List}}
+			c.BNodeID = ""
+		}
+		if c.Routes == nil {
+			c.Routes = []ChainRoute{}
+		}
 		out = append(out, &c)
 	}
 	return out, rows.Err()
@@ -449,8 +544,6 @@ func (s *Store) DailyTraffic(date string) (map[string][2]int64, error) {
 	return out, rows.Err()
 }
 
-// ResetTraffic：清掉指定节点的累计流量与今日流量（本月统计里
-// 今天的部分随之清掉，因为本月就是每日行之和；限额设置不动）。
 func (s *Store) ResetTraffic(inboundID string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -460,7 +553,7 @@ func (s *Store) ResetTraffic(inboundID string) error {
 	if _, err := tx.Exec("DELETE FROM traffic_total WHERE inbound_id=?", inboundID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("DELETE FROM traffic_daily WHERE inbound_id=? AND date=?", inboundID, time.Now().Format("2006-01-02")); err != nil {
+	if _, err := tx.Exec("DELETE FROM traffic_daily WHERE inbound_id=?", inboundID); err != nil {
 		return err
 	}
 	return tx.Commit()

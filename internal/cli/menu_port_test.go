@@ -1,6 +1,6 @@
 package cli
 
-// v1.0.5：菜单改端口走服务端 panel-access 接口，不再自己改服务文件。
+// 菜单改端口走服务端 panel-access 接口，不再自己改服务文件。
 // 此文件只留端口解析测试 + 接口调用测试；服务文件改写由服务端
 // panel_access_test.go 覆盖。
 

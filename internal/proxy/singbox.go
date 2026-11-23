@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -15,12 +16,6 @@ import (
 // 入站页（TUIC / Naive / Hysteria2）、TLS 共享页（reality / certificate_path）、
 // WireGuard 端点页、路由规则动作页（sniff / route）、V2Ray 传输页。
 // 生成结果必须过 `sing-box check` 校验（见 singbox_test.go），文档核对代替不了这一步。
-//
-// 约定：
-//   - 入站 tag 沿用 in-<节点 id>，WireGuard 端点 tag 用 wg-<节点 id>，
-//     链式出站 tag 用 chain-<链式 id>，与旧版 xray / 翻译层命名一致。
-//   - 旧记录缺 Mode 字段时一律按原默认档处理（VLESS=reality、VMess=tcp、
-//     Trojan=reality），老库平移不改行为。
 
 // ---------- 新增协议配置 ----------
 
@@ -58,29 +53,20 @@ func DefaultNaive() NaiveConfig {
 }
 
 // ---------- Snell ----------
-//
-// 预设就是最佳档：默认 v5（稳定、客户端支持最广）+ HTTP 混淆
-// （obfs_host bing.com），v6 可手动切（流量整形内置，
-// 但还是 beta）。v5 服务端接受 v4/v5 客户端（两者线格式相同，
-// sing-box 不提供单独的 v4 服务端）；v6 的 PSK 必须是 12-255 字节。
-// 注意：入站没有 obfs_host 字段（那是客户端出站字段），
-// 混淆 Host 只进链接，不进服务端配置。
 
 type SnellConfig struct {
 	Version  int    `json:"version"` // 5 | 6，默认 5
 	PSK      string `json:"psk"`
 	ObfsMode string `json:"obfs_mode"` // v5：none | http，默认 http
-	ObfsHost string `json:"obfs_host"` // v5 http 混淆 Host，默认 bing.com（只进链接）
+	ObfsHost string `json:"obfs_host"` // v5 http 混淆 Host，默认从 SNI 池随机（排除 bing.com）
 	Mode     string `json:"mode"`      // v6：default | unshaped | unsafe-raw，默认 default
 	Listen   string `json:"listen"`
 }
 
 func DefaultSnell() SnellConfig {
-	return SnellConfig{Version: 5, PSK: randHex(16), ObfsMode: "http", ObfsHost: "bing.com", Mode: "default"}
+	return SnellConfig{Version: 5, PSK: randHex(16), ObfsMode: "http", ObfsHost: RandomSnellObfsHost(), Mode: "default"}
 }
 
-// SingBoxSnellInbound：version 非 5/6 时按 5 处理（归一化层已拦，
-// 这里是最后一道防线，不让非法值进 sing-box 校验）。
 func SingBoxSnellInbound(tag string, port int, cfg SnellConfig) map[string]interface{} {
 	ver := cfg.Version
 	if ver != 5 && ver != 6 {
@@ -110,22 +96,11 @@ func SingBoxSnellInbound(tag string, port int, cfg SnellConfig) map[string]inter
 	return in
 }
 
-// SnellLink：生态通用格式（mihomo/Surge/Stash 通用，
-// sing-box 自身暂不解析 snell:// 链接）。
-// v5 服务端：snell://psk@host:port?version=4&obfs=http&obfs-host=bing.com#name
-// v6 服务端：snell://psk@host:port?version=6&mode=default#name
-// 链接里的 version 必须是客户端版本，不能写服务端版本：
-// sing-box 的 Snell 出站只认 4 和 6，写 5 时 Hiddify 这类
-// sing-box 内核客户端解析订阅、生成运行配置就会炸
-// （snell: unsupported version: 5，2026-11-12 实测）；
-// v4 客户端连 v5 服务端是官方支持的组合，v5 的线上传输
-// 本来就和 v4 相同（只差 QUIC 代理模式，sing-box 不支持它）。
 func SnellLink(address string, port int, cfg SnellConfig, name string) string {
 	ver := cfg.Version
 	if ver != 5 && ver != 6 {
 		ver = 5
 	}
-	// 服务端版本 → 客户端版本：v5 服务端配 v4 客户端，v6 配 v6。
 	urlVer := 4
 	if ver == 6 {
 		urlVer = 6
@@ -141,7 +116,9 @@ func SnellLink(address string, port int, cfg SnellConfig, name string) string {
 			v.Set("obfs", "http")
 			host := cfg.ObfsHost
 			if host == "" {
-				host = "bing.com"
+				// normalize 创建时一定会填随机 Host，这里只是兜底——
+				// 绝不回退到 bing.com（已退役的默认 Host）。
+				host = RandomSnellObfsHost()
 			}
 			v.Set("obfs-host", host)
 		}
@@ -152,24 +129,29 @@ func SnellLink(address string, port int, cfg SnellConfig, name string) string {
 		}
 		v.Set("mode", mode)
 	}
-	return "snell://" + qesc(cfg.PSK) + "@" + hostPort(address, port) + "?" + v.Encode() + "#" + qesc(name)
+	return "snell://" + qesc(cfg.PSK) + "@" + hostPort(address, port) + "?" + v.Encode() + "#" + url.PathEscape(name)
+}
+
+// ShadowTLSLink：面板自定的 shadowtls:// 分享链接（非公开标准）。
+// 密码放 userinfo（qesc 转义）、内层 SS 密码放查询串；version 省略即 3。
+func ShadowTLSLink(address string, port int, cfg ShadowTLSConfig, name string) string {
+	method := cfg.SSMethod
+	if method == "" {
+		method = "2022-blake3-aes-128-gcm"
+	}
+	handshake := cfg.Handshake
+	if handshake == "" {
+		handshake = "gateway.icloud.com"
+	}
+	v := url.Values{}
+	v.Set("version", "3")
+	v.Set("handshake", handshake)
+	v.Set("ss-method", method)
+	v.Set("ss-password", cfg.SSPassword)
+	return "shadowtls://" + qesc(cfg.Password) + "@" + hostPort(address, port) + "?" + v.Encode() + "#" + url.PathEscape(name)
 }
 
 // ---------- ShadowTLS ----------
-//
-// 主流最佳架构：ShadowTLS v3（strict_mode）套 SS2022。
-// ShadowTLS 只负责“看起来像真 TLS 握手”（握手直接转发给
-// gateway.icloud.com 这种大站，探测者拿到的是真证书、真页面），
-// 握手后的流量本身不加密——必须套一层 SS 才完整。
-// 所以一个 ShadowTLS 节点 = 两个入站：公网端口的 shadowtls
-// 入站（detour 到内层）+ 只听 127.0.0.1 的 SS 入站（内层，
-// 2022-blake3-aes-128-gcm，端口创建时分配，绝不对外暴露，
-// 否则就是给 GFW 的被动全加密探测留的靶子）。
-// strict_mode 强制开：未通过认证的连接直接断开——共识最佳实践
-// （v1/v2 的主动探测漏洞就是这么堵上的）。
-// 交付物是 sing-box 客户端 JSON（两个出站：SS detour 到
-// ShadowTLS），和 Naive 同款做法：ShadowTLS 没有标准 URL
-// 链接格式，拼出来的 shadowtls:// 只有个别客户端认。
 
 type ShadowTLSConfig struct {
 	Version    int    `json:"version"`     // 3，固定
@@ -193,7 +175,6 @@ func DefaultShadowTLS() ShadowTLSConfig {
 	}
 }
 
-// SingBoxShadowTLSInbound：公网 shadowtls 入站，detour 到同节点内层 SS。
 func SingBoxShadowTLSInbound(tag string, port int, cfg ShadowTLSConfig) map[string]interface{} {
 	handshake := cfg.Handshake
 	if handshake == "" {
@@ -212,7 +193,6 @@ func SingBoxShadowTLSInbound(tag string, port int, cfg ShadowTLSConfig) map[stri
 	}
 }
 
-// SingBoxShadowTLSInnerSS：内层 SS 入站，只听回环，绝不对外。
 func SingBoxShadowTLSInnerSS(tag string, cfg ShadowTLSConfig) map[string]interface{} {
 	method := cfg.SSMethod
 	if method == "" {
@@ -228,14 +208,6 @@ func SingBoxShadowTLSInnerSS(tag string, cfg ShadowTLSConfig) map[string]interfa
 	}
 }
 
-// ShadowTLSClientJSON：客户端 JSON（两个出站，SS detour 到 ShadowTLS）。
-// 出站 tag 用节点名 + 后缀：两个 ShadowTLS 节点拼进同一份客户端配置时
-// 也不会撞 tag。
-// 载体出站 tag 带 " §hide§"：Hiddify 的约定（hiddify-core
-// v2/hcore/proxy_info.go：tag 含 §hide§ 的代理不在代理列表显示），
-// 这样 Hiddify 里 ShadowTLS 只显示一个节点条目，载体不再单独占一行
-// （2026-11-12 PAPA 截图反馈）；sing-box 本身不认 §hide§，只当它是
-// tag 字符串，detour 按原样指过去，check 照过。
 func ShadowTLSClientJSON(address string, port int, cfg ShadowTLSConfig, name string) string {
 	method := cfg.SSMethod
 	if method == "" {
@@ -273,10 +245,6 @@ func ShadowTLSClientJSON(address string, port int, cfg ShadowTLSConfig, name str
 
 // ---------- TLS / 传输小件 ----------
 
-// sbListen：入站监听默认值一律双栈 "::"（Linux 默认 bindv6only=0 时
-// "::" 同时接受 v4/v6，v4 客户端走 v4-mapped，不用再分两个监听）。
-// 安全前提已在甲骨文（有公网 v6）和 RN（无公网 v6、bindv6only=0）上实测：
-// "::" 在无公网 v6 的机器上照样起、v4 照样通；显式配过 Listen 的节点不受影响。
 func sbListen(listen, def string) string {
 	if listen != "" {
 		return listen
@@ -284,7 +252,6 @@ func sbListen(listen, def string) string {
 	return def
 }
 
-// realityTLS：入站 Reality。short_id 在 sing-box 是数组，xray 的单个值要包成数组。
 func realityTLS(serverName, privateKey, shortID, dest string) map[string]interface{} {
 	host, portStr, err := net.SplitHostPort(dest)
 	if err != nil {
@@ -312,7 +279,6 @@ func realityTLS(serverName, privateKey, shortID, dest string) map[string]interfa
 	return tls
 }
 
-// certTLS：证书 TLS（自签或 CA 证书都走这对路径）。server_name 为空时不写该键。
 func certTLS(serverName, certPath, keyPath string) map[string]interface{} {
 	tls := map[string]interface{}{
 		"enabled":          true,
@@ -360,8 +326,6 @@ func httpUpgradeTransport(host, path string) map[string]interface{} {
 
 // ---------- VLESS ----------
 
-// SingBoxVLESSInbound：Mode ""=reality；ws/h2/httpupgrade 走证书 TLS，
-// 此时 flow 必须丢掉（xtls-rprx-vision 只用于 TCP 裸流，带传输会直接报错）。
 func SingBoxVLESSInbound(tag string, port int, sni string, cfg VLESSConfig) map[string]interface{} {
 	mode := cfg.Mode
 	if mode == "" {
@@ -386,7 +350,6 @@ func SingBoxVLESSInbound(tag string, port int, sni string, cfg VLESSConfig) map[
 		in["users"] = []interface{}{user}
 		in["tls"] = realityTLS(sni, cfg.PrivateKey, cfg.ShortID, dest)
 	default:
-		// ws / h2 / httpupgrade：证书 TLS 档
 		domain := cfg.Domain
 		if domain == "" {
 			domain = sni
@@ -407,8 +370,6 @@ func SingBoxVLESSInbound(tag string, port int, sni string, cfg VLESSConfig) map[
 
 // ---------- VMess ----------
 
-// SingBoxVMessInbound：Mode ""=tcp；cf=WS+TLS（自签，沿用现有 CF 档）；
-// http=明文 http 传输；quic=QUIC 传输（必须配 TLS）；h2/httpupgrade=证书 TLS 档。
 func SingBoxVMessInbound(tag string, port int, cfg VMessConfig) map[string]interface{} {
 	mode := cfg.Mode
 	if mode == "" {
@@ -423,7 +384,6 @@ func SingBoxVMessInbound(tag string, port int, cfg VMessConfig) map[string]inter
 	}
 	switch mode {
 	case "tcp":
-		// 裸 TCP：无 transport、无 tls
 	case "cf":
 		in["tls"] = certTLS(cfg.Domain, cfg.CertFile, cfg.KeyFile)
 		in["transport"] = wsTransport(cfg.Path, cfg.Domain)
@@ -444,8 +404,6 @@ func SingBoxVMessInbound(tag string, port int, cfg VMessConfig) map[string]inter
 
 // ---------- Trojan ----------
 
-// SingBoxTrojanInbound：Mode ""=reality；cf=WS+TLS（自签，沿用现有 CF 档）；
-// h2/httpupgrade=证书 TLS 档。
 func SingBoxTrojanInbound(tag string, port int, sni string, cfg TrojanConfig) map[string]interface{} {
 	mode := cfg.Mode
 	if mode == "" {
@@ -526,9 +484,6 @@ func SingBoxHTTPInbound(tag string, port int, cfg HTTPConfig) map[string]interfa
 
 // ---------- Hysteria2 / TUIC / AnyTLS / Naive ----------
 
-// SingBoxHy2Inbound：sing-box 原生 hysteria2 入站，hysteria 二进制不再需要。
-// server_name 取节点 SNI（自签证书 CN 与之对应）；up/down 为空即自动。
-// ignore_client_bandwidth 字段名以 sing-box check 校验为准，不通过则删。
 func SingBoxHy2Inbound(tag string, port int, sni, certPath, keyPath string, cfg Hy2Config) map[string]interface{} {
 	in := map[string]interface{}{
 		"type":        "hysteria2",
@@ -538,7 +493,6 @@ func SingBoxHy2Inbound(tag string, port int, sni, certPath, keyPath string, cfg 
 		"users":       []interface{}{map[string]interface{}{"password": cfg.Password}},
 		"tls":         certTLS(sni, certPath, keyPath),
 	}
-	// alpn h3 是 Hy2 的固定要求，certTLS 不含 alpn，这里补上。
 	in["tls"].(map[string]interface{})["alpn"] = []string{"h3"}
 	if cfg.ObfsType != "" {
 		in["obfs"] = map[string]interface{}{"type": cfg.ObfsType, "password": cfg.ObfsPassword}
@@ -555,9 +509,6 @@ func SingBoxHy2Inbound(tag string, port int, sni, certPath, keyPath string, cfg 
 	return in
 }
 
-// SingBoxTUICInbound：官方默认拥塞算法是 cubic，这里显式写 bbr；
-// zero_rtt 官方强烈建议关闭（重放攻击），显式写 false。
-// 入站没有 udp_relay_mode 字段（那是客户端出站字段），不要写。
 func SingBoxTUICInbound(tag string, port int, sni, certPath, keyPath string, cfg TUICConfig) map[string]interface{} {
 	in := map[string]interface{}{
 		"type":               "tuic",
@@ -573,8 +524,6 @@ func SingBoxTUICInbound(tag string, port int, sni, certPath, keyPath string, cfg
 	return in
 }
 
-// SingBoxAnyTLSInbound：padding_scheme 不写，用 sing-anytls 默认方案；
-// tls 一律启用 + 自签证书（与 Hy2/TUIC 同款做法）。
 func SingBoxAnyTLSInbound(tag string, port int, sni, certPath, keyPath string, cfg AnyTLSConfig) map[string]interface{} {
 	return map[string]interface{}{
 		"type":        "anytls",
@@ -586,8 +535,6 @@ func SingBoxAnyTLSInbound(tag string, port int, sni, certPath, keyPath string, c
 	}
 }
 
-// SingBoxNaiveInbound：v1 只用 tcp（HTTP/2），不依赖 QUIC；
-// tls 必须用真域名 + CA 证书，自签会破坏 Naive 的设计目的，生产不用。
 func SingBoxNaiveInbound(tag string, port int, cfg NaiveConfig, certPath, keyPath string) map[string]interface{} {
 	return map[string]interface{}{
 		"type":        "naive",
@@ -602,16 +549,12 @@ func SingBoxNaiveInbound(tag string, port int, cfg NaiveConfig, certPath, keyPat
 
 // ---------- WireGuard 端点 ----------
 
-// SingBoxWGEndpoint：sing-box 1.11+ 起 WireGuard 是 endpoints 段的端点，不是入站。
-// address 是必填新增项：xray 入站不需要服务端隧道地址，sing-box 端点必须有，
-// 取 10.0.0.1/32 与客户端 10.0.0.2/32 配对（每节点独立设备，地址可复用）。
-// system=false 走 gVisor 用户态，不用内核模块。客户端交付文本不变。
 func SingBoxWGEndpoint(tag string, port int, cfg WGConfig) map[string]interface{} {
 	ep := map[string]interface{}{
 		"type":        "wireguard",
 		"tag":         tag,
 		"system":      false,
-		"mtu":         1420,
+		"mtu":         1280,
 		"address":     []string{"10.0.0.1/32"},
 		"private_key": cfg.ServerPriv,
 		"listen_port": port,
@@ -620,9 +563,6 @@ func SingBoxWGEndpoint(tag string, port int, cfg WGConfig) map[string]interface{
 			"allowed_ips": []string{cfg.ClientIP},
 		}},
 	}
-	// Listen 以前被直接丢弃：填了 127.0.0.1 也照样监听全部接口（P1-26）。
-	// 只在用户显式填了时透传；不填时保持 sing-box 默认（双栈），不动
-	// 已有节点的监听行为。
 	if cfg.Listen != "" {
 		ep["listen"] = cfg.Listen
 	}
@@ -630,10 +570,6 @@ func SingBoxWGEndpoint(tag string, port int, cfg WGConfig) map[string]interface{
 }
 
 // ---------- B 节点出站转换 ----------
-//
-// 存储的 B 节点 config 是 xray 格式出站（parseVLESS/parseVMess/parseTrojan/
-// parseSS/parseSocksHTTP 的产物），hy2 存的已是 sing-box 格式。
-// 转换失败一律返回 error，调用方不得静默丢弃（宁可整条链式报错，不可悄悄直连）。
 
 func sbStr(m map[string]interface{}, key string) string {
 	if m == nil {
@@ -678,8 +614,6 @@ func sbInt(v interface{}) int {
 	return 0
 }
 
-// xrayTLSOutbound：xray streamSettings 安全层 → sing-box 出站 tls。
-// reality 出站只有 public_key/short_id，没有 handshake（handshake 是入站才有的）。
 func xrayTLSOutbound(ss map[string]interface{}) (map[string]interface{}, error) {
 	sec := sbStr(ss, "security")
 	switch sec {
@@ -698,7 +632,6 @@ func xrayTLSOutbound(ss map[string]interface{}) (map[string]interface{}, error) 
 		if sid := sbStr(rs, "shortId"); sid != "" {
 			tls["reality"].(map[string]interface{})["short_id"] = sid
 		}
-		// sing-box reality 客户端强制要求 uTLS（xray 存的 fingerprint 默认 chrome）
 		fp := sbStr(rs, "fingerprint")
 		if fp == "" {
 			fp = "chrome"
@@ -728,8 +661,6 @@ func xrayTLSOutbound(ss map[string]interface{}) (map[string]interface{}, error) 
 	}
 }
 
-// xrayTransportOutbound：xray streamSettings 传输 → sing-box 出站 transport。
-// 存储的 B 节点只可能有 tcp/ws/grpc（解析器只接受这三种），其他一律报错。
 func xrayTransportOutbound(ss map[string]interface{}) (map[string]interface{}, error) {
 	netw := sbStr(ss, "network")
 	switch netw {
@@ -739,7 +670,6 @@ func xrayTransportOutbound(ss map[string]interface{}) (map[string]interface{}, e
 		if sbStr(header, "type") == "http" {
 			req := sbMap(header, "request")
 			var host, path string
-			// xray 格式：request.headers.Host []string，request.path []string
 			if hm, ok := req["headers"].(map[string]interface{}); ok {
 				if h, ok := hm["Host"].([]interface{}); ok && len(h) > 0 {
 					host, _ = h[0].(string)
@@ -755,8 +685,6 @@ func xrayTransportOutbound(ss map[string]interface{}) (map[string]interface{}, e
 		ws := sbMap(ss, "wsSettings")
 		var host string
 		if hm, ok := ws["headers"].(map[string]interface{}); ok {
-			// Host 可能是字符串也可能是数组（xray 两种写法都认）：
-			// 以前只断言字符串，数组形态直接得 ""，静默丢 Host。
 			switch h := hm["Host"].(type) {
 			case string:
 				host = h
@@ -774,6 +702,20 @@ func xrayTransportOutbound(ss map[string]interface{}) (map[string]interface{}, e
 	case "grpc":
 		gs := sbMap(ss, "grpcSettings")
 		return map[string]interface{}{"type": "grpc", "service_name": sbStr(gs, "serviceName")}, nil
+	case "h2":
+		hs := sbMap(ss, "httpSettings")
+		var host string
+		if h, ok := hs["host"].([]interface{}); ok && len(h) > 0 {
+			host, _ = h[0].(string)
+		} else if h, ok := hs["host"].([]string); ok && len(h) > 0 {
+			host = h[0]
+		}
+		return httpTransport(host, sbStr(hs, "path")), nil
+	case "httpupgrade":
+		hus := sbMap(ss, "httpupgradeSettings")
+		return httpUpgradeTransport(sbStr(hus, "host"), sbStr(hus, "path")), nil
+	case "quic":
+		return map[string]interface{}{"type": "quic"}, nil
 	case "":
 		return nil, nil
 	default:
@@ -781,8 +723,6 @@ func xrayTransportOutbound(ss map[string]interface{}) (map[string]interface{}, e
 	}
 }
 
-// checkBServer：出站地址与端口校验（以前空地址/0 端口直接进配置，
-// sing-box 校验失败时错误里没有 B 节点名，无法定位）。
 func checkBServer(ob map[string]interface{}) error {
 	if sbStr(ob, "server") == "" {
 		return fmt.Errorf("B 节点出站地址为空")
@@ -793,10 +733,10 @@ func checkBServer(ob map[string]interface{}) error {
 	return nil
 }
 
-// SingBoxBOutbound：存储的 B 节点 → sing-box 出站。tag 由调用方传 chain-<id>。
-func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{}, error) {
-	// 入站口径与出站口径归一：hy2/ss 存成入站名时也要能转，
-	// 以前直接报“不支持的 B 节点协议”，整条链式 Apply 失败。
+// SingBoxBOutbound：把 B 节点的存储配置转成 sing-box 出站。
+// 一般协议返回 1 个出站；ShadowTLS 返回 2 个（SS 出站在前、其 detour 指向
+// shadowtls 出站在后），调用方必须把两个都追加进 outbounds，路由指向第一个的 tag。
+func SingBoxBOutbound(protocol, configJSON, tag string) ([]map[string]interface{}, error) {
 	switch protocol {
 	case "hy2":
 		protocol = "hysteria2"
@@ -808,12 +748,11 @@ func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{},
 		return nil, fmt.Errorf("B 节点配置解析失败：%w", err)
 	}
 	if protocol == "hysteria2" {
-		// 已是 sing-box 格式，只换 tag；透传前同样校验必填字段。
 		stored["tag"] = tag
 		if err := checkBServer(stored); err != nil {
 			return nil, err
 		}
-		return stored, nil
+		return []map[string]interface{}{stored}, nil
 	}
 	ss := sbMap(stored, "streamSettings")
 	settings := sbMap(stored, "settings")
@@ -845,7 +784,6 @@ func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{},
 		}
 		if protocol == "vless" {
 			ob["uuid"] = sbStr(user, "id")
-			// vision 只用于 TCP 裸流：带传输时 flow 必须丢掉
 			if tr == nil {
 				if f := sbStr(user, "flow"); f != "" {
 					ob["flow"] = f
@@ -853,8 +791,6 @@ func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{},
 			}
 		} else {
 			ob["uuid"] = sbStr(user, "id")
-			// sing-box vmess 出站没有 alterId 字段（只支持 AEAD）；
-			// 存量 B 节点若 alterId 非 0，直接报错，不静默降级。
 			if aid := sbInt(user["alterId"]); aid != 0 {
 				return nil, fmt.Errorf("vmess B 节点 alterId=%d 非 0，sing-box 只支持 AEAD（alterId=0）", aid)
 			}
@@ -871,7 +807,7 @@ func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{},
 		if err := checkBServer(ob); err != nil {
 			return nil, err
 		}
-		return ob, nil
+		return []map[string]interface{}{ob}, nil
 	case "trojan":
 		servers := sbList(settings, "servers")
 		if len(servers) == 0 {
@@ -902,7 +838,7 @@ func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{},
 		if err := checkBServer(ob); err != nil {
 			return nil, err
 		}
-		return ob, nil
+		return []map[string]interface{}{ob}, nil
 	case "shadowsocks":
 		servers := sbList(settings, "servers")
 		if len(servers) == 0 {
@@ -920,7 +856,108 @@ func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{},
 		if err := checkBServer(ob); err != nil {
 			return nil, err
 		}
-		return ob, nil
+		return []map[string]interface{}{ob}, nil
+	case "snell":
+		ver := sbInt(stored["version"])
+		if ver == 4 {
+			ver = 5 // 个别外链直接写线路版 4，等同面板 v5
+		}
+		if ver != 5 && ver != 6 {
+			ver = 5
+		}
+		if sbStr(stored, "psk") == "" {
+			return nil, fmt.Errorf("snell B 节点缺少密钥")
+		}
+		// 线路版本号：面板 v5 对应 sing-box 出站 version 4（客户端按 v4 拨号），
+		// 面板 v6 对应 version 6；sing-box 出站不认 version 5，也不认 obfs 字段。
+		wireVer := 4
+		if ver == 6 {
+			wireVer = 6
+		}
+		ob := map[string]interface{}{
+			"type":        "snell",
+			"tag":         tag,
+			"server":      sbStr(stored, "server"),
+			"server_port": sbInt(stored["server_port"]),
+			"version":     wireVer,
+			"psk":         sbStr(stored, "psk"),
+		}
+		if ver == 5 {
+			// v5 HTTP 混淆走 obfs_mode/obfs_host（与入站同名字段）。
+			mode := sbStr(stored, "obfs_mode")
+			host := sbStr(stored, "obfs_host")
+			if mode == "" {
+				// 兼容旧存法：obfs 对象 {type:http, host}
+				if rawObfs, ok := stored["obfs"]; ok {
+					if m, ok := rawObfs.(map[string]interface{}); ok && sbStr(m, "type") == "http" {
+						mode = "http"
+						host = sbStr(m, "host")
+					}
+				}
+			}
+			if mode == "http" {
+				if host == "" {
+					host = "bing.com"
+				}
+				ob["obfs_mode"] = "http"
+				ob["obfs_host"] = host
+			}
+		} else if m := sbStr(stored, "mode"); m != "" {
+			ob["mode"] = m
+		}
+		if err := checkBServer(ob); err != nil {
+			return nil, err
+		}
+		return []map[string]interface{}{ob}, nil
+	case "shadowtls":
+		// ShadowTLS 是两段式：SS 出站 detour 到 shadowtls 出站。
+		// 两个出站的 server/port 相同；路由指向 SS 出站（tag），detour 指向 tag+"-shadowtls"。
+		ver := sbInt(stored["version"])
+		if ver == 0 {
+			ver = 3
+		}
+		if ver != 3 {
+			return nil, fmt.Errorf("shadowtls B 节点不支持的版本 %d（仅支持 v3）", ver)
+		}
+		if sbStr(stored, "password") == "" {
+			return nil, fmt.Errorf("shadowtls B 节点缺少密码")
+		}
+		if sbStr(stored, "ss_password") == "" {
+			return nil, fmt.Errorf("shadowtls B 节点缺少内层 SS 密码")
+		}
+		handshake := sbStr(stored, "handshake")
+		if handshake == "" {
+			handshake = "gateway.icloud.com"
+		}
+		method := sbStr(stored, "ss_method")
+		if method == "" {
+			method = "2022-blake3-aes-128-gcm"
+		}
+		ss := map[string]interface{}{
+			"type":        "shadowsocks",
+			"tag":         tag,
+			"server":      sbStr(stored, "server"),
+			"server_port": sbInt(stored["server_port"]),
+			"method":      method,
+			"password":    sbStr(stored, "ss_password"),
+			"detour":      tag + "-shadowtls",
+		}
+		st := map[string]interface{}{
+			"type":        "shadowtls",
+			"tag":         tag + "-shadowtls",
+			"server":      sbStr(stored, "server"),
+			"server_port": sbInt(stored["server_port"]),
+			"version":     3,
+			"password":    sbStr(stored, "password"),
+			"tls":         map[string]interface{}{"enabled": true, "server_name": handshake},
+		}
+		if err := checkBServer(ss); err != nil {
+			return nil, err
+		}
+		if err := checkBServer(st); err != nil {
+			return nil, err
+		}
+		return []map[string]interface{}{ss, st}, nil
 	case "socks", "http":
 		servers := sbList(settings, "servers")
 		if len(servers) == 0 {
@@ -939,59 +976,215 @@ func SingBoxBOutbound(protocol, configJSON, tag string) (map[string]interface{},
 				ob["password"] = sbStr(u, "pass")
 			}
 		}
-		// https B 节点记下来的 TLS 原样带到出站（解析层已修：见 parseSocksHTTP）。
 		if tls, ok := stored["tls"]; ok {
 			ob["tls"] = tls
 		}
 		if err := checkBServer(ob); err != nil {
 			return nil, err
 		}
-		return ob, nil
+		return []map[string]interface{}{ob}, nil
 	default:
 		return nil, fmt.Errorf("不支持的 B 节点协议：%s", protocol)
 	}
 }
 
-// ---------- 链式路由 ----------
+// ---------- 链式与多节点分流路由 ----------
 
-// ChainInput：一条链式（调用方已校验 A 是启用中的 vless 入站）。
-type ChainInput struct {
-	InboundTag  string // in-<A 节点 id>
-	OutboundTag string // chain-<链式 id>
-	List        string // 一行一个域名/IP/CIDR（分流模式）
-	Direct      bool   // 直接链式：A 的全部流量都走 B，不用清单
+// CanBeChainA 判断本地入站协议能否作为链式入口 A。
+// WireGuard 在 sing-box 中是 endpoint 而非 inbound，不走入站嗅探路由，其余 12 种入站协议全部支持。
+func CanBeChainA(protocol string) bool {
+	switch protocol {
+	case "vless", "vmess", "trojan", "hy2", "tuic", "anytls", "naive", "snell", "ss", "socks", "http", "shadowtls":
+		return true
+	}
+	return false
 }
 
-// SingBoxChainRules：sniff 规则在前（非终结，嗅探出域名供后续规则匹配），
-// 随后每条链式：分流一条域名规则 + 一条 IP 规则（绑各自入站，防偷渡）；
-// 直接链式一条无匹配条件的 catch-all（只绑自己的入站，
-// 一 A 一链，不会偷别的入站的流量）。末尾由 FullConfig 补 final direct。
+// ChainInboundTag 返回链式入口在 sing-box 路由表里绑定的入站 tag。
+// ShadowTLS 外层入站只拆 TLS 握手并 detour 到内层 SS 入站（in-<id>-ss），
+// 真正进入路由器的流量来自 in-<id>-ss，其余协议直接绑 in-<id>。
+func ChainInboundTag(id, protocol string) string {
+	if protocol == "shadowtls" {
+		return "in-" + id + "-ss"
+	}
+	return "in-" + id
+}
+
+// ChainRouteInput：单组“清单 -> B 出站”输入。
+type ChainRouteInput struct {
+	OutboundTag string
+	List        string
+}
+
+// ChainRouteSpec：校验层接收的分流组原始输入。
+type ChainRouteSpec struct {
+	BNodeID string
+	List    string
+}
+
+// ChainInput：一条入口 A 的链式路由输入（兼容旧单路字段与新多路 Routes）。
+type ChainInput struct {
+	InboundTag  string            // in-<A 节点 id> 或 in-<A>-ss
+	OutboundTag string            // Direct 模式的出站；多路 Routes 非空时若非空则作为该 A 节点的未命中兜底出站；Routes 为空时兼容老单路出站
+	List        string            // 兼容老单路分流清单（Routes 为空时使用）
+	Routes      []ChainRouteInput // 多路分流组（按顺序评估，已做无重叠校验）
+	Direct      bool              // 全局直通：A 的全部流量都走 OutboundTag
+}
+
+// ValidateAndNormalizeRoutes 严格校验多路分流组：
+// 1. 同一条链内禁止重复选择同一个 B 节点（提示直接合并清单）；
+// 2. 组内自动去重，跨组严格拦截重复域名及父子包含域名（如 google.com 与 mail.google.com）；
+// 3. 跨组严格拦截重叠的 IP / CIDR 网段（如 1.1.1.0/24 与 1.1.1.1）。
+func ValidateAndNormalizeRoutes(routes []ChainRouteSpec) ([]string, error) {
+	if len(routes) == 0 {
+		return nil, fmt.Errorf("至少需要添加 1 个分流落地组")
+	}
+	if len(routes) > 50 {
+		return nil, fmt.Errorf("分流组最多不超过 50 个")
+	}
+	seenB := map[string]int{}
+	type domainClaim struct {
+		group  int
+		domain string
+	}
+	type prefixClaim struct {
+		group int
+		raw   string
+		pfx   netip.Prefix
+	}
+	var allDomains []domainClaim
+	var allPrefixes []prefixClaim
+	normalized := make([]string, len(routes))
+
+	for i, r := range routes {
+		gNum := i + 1
+		if r.BNodeID == "" {
+			return nil, fmt.Errorf("第 %d 组未选择落地 B 节点", gNum)
+		}
+		if prev, ok := seenB[r.BNodeID]; ok {
+			return nil, fmt.Errorf("第 %d 组与第 %d 组选择了同一个 B 节点，请将清单合并到同一组", gNum, prev)
+		}
+		seenB[r.BNodeID] = gNum
+
+		suffixes, cidrs, err := ParseChainList(r.List)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 组：%w", gNum, err)
+		}
+
+		cleanDomains := make([]string, 0, len(suffixes))
+		seenDomInGroup := map[string]bool{}
+		for _, d := range suffixes {
+			dl := strings.ToLower(d)
+			if seenDomInGroup[dl] {
+				continue
+			}
+			seenDomInGroup[dl] = true
+			for _, prev := range allDomains {
+				if dl == prev.domain || strings.HasSuffix(dl, "."+prev.domain) || strings.HasSuffix(prev.domain, "."+dl) {
+					return nil, fmt.Errorf("分流冲突：第 %d 组的域名 %q 与第 %d 组的 %q 重复或存在子域名包含关系", gNum, d, prev.group, prev.domain)
+				}
+			}
+			allDomains = append(allDomains, domainClaim{group: gNum, domain: dl})
+			cleanDomains = append(cleanDomains, dl)
+		}
+
+		cleanCIDRs := make([]string, 0, len(cidrs))
+		seenPfxInGroup := map[netip.Prefix]bool{}
+		for _, c := range cidrs {
+			var pfx netip.Prefix
+			if strings.Contains(c, "/") {
+				p, err := netip.ParsePrefix(c)
+				if err != nil {
+					return nil, fmt.Errorf("第 %d 组的网段 %q 格式无效", gNum, c)
+				}
+				pfx = p.Masked()
+			} else {
+				addr, err := netip.ParseAddr(c)
+				if err != nil {
+					return nil, fmt.Errorf("第 %d 组的 IP %q 格式无效", gNum, c)
+				}
+				pfx = netip.PrefixFrom(addr, addr.BitLen())
+			}
+			if seenPfxInGroup[pfx] {
+				continue
+			}
+			seenPfxInGroup[pfx] = true
+			for _, prev := range allPrefixes {
+				if pfx.Overlaps(prev.pfx) {
+					return nil, fmt.Errorf("分流冲突：第 %d 组的 IP/网段 %q 与第 %d 组的 %q 存在重叠", gNum, c, prev.group, prev.raw)
+				}
+			}
+			allPrefixes = append(allPrefixes, prefixClaim{group: gNum, raw: c, pfx: pfx})
+			cleanCIDRs = append(cleanCIDRs, c)
+		}
+
+		normalized[i] = strings.Join(append(cleanDomains, cleanCIDRs...), "\n")
+	}
+	return normalized, nil
+}
+
+// SingBoxChainRules 生成链式嗅探与分流路由规则。
 func SingBoxChainRules(chains []ChainInput) []map[string]interface{} {
 	if len(chains) == 0 {
 		return nil
 	}
 	var aTags []interface{}
+	seenIn := map[string]bool{}
 	for _, ch := range chains {
-		aTags = append(aTags, ch.InboundTag)
+		if !seenIn[ch.InboundTag] {
+			seenIn[ch.InboundTag] = true
+			aTags = append(aTags, ch.InboundTag)
+		}
 	}
 	rules := []map[string]interface{}{
 		{"inbound": aTags, "action": "sniff"},
 	}
 	for _, ch := range chains {
 		if ch.Direct {
-			// 直接链式是用户明确选的“全部走 B”，不是清单解析失败
-			// 漏出来的空规则——两者绝不能混为一谈。
-			rules = append(rules, map[string]interface{}{
-				"inbound":  []string{ch.InboundTag},
-				"action":   "route",
-				"outbound": ch.OutboundTag,
-			})
+			if ch.OutboundTag != "" {
+				rules = append(rules, map[string]interface{}{
+					"inbound":  []string{ch.InboundTag},
+					"action":   "route",
+					"outbound": ch.OutboundTag,
+				})
+			}
 			continue
 		}
+		if len(ch.Routes) > 0 {
+			for _, rt := range ch.Routes {
+				if rt.OutboundTag == "" {
+					continue
+				}
+				suffixes, cidrs := splitDomainList(rt.List)
+				if len(suffixes) > 0 {
+					rules = append(rules, map[string]interface{}{
+						"inbound":       []string{ch.InboundTag},
+						"action":        "route",
+						"outbound":      rt.OutboundTag,
+						"domain_suffix": suffixes,
+					})
+				}
+				if len(cidrs) > 0 {
+					rules = append(rules, map[string]interface{}{
+						"inbound":  []string{ch.InboundTag},
+						"action":   "route",
+						"outbound": rt.OutboundTag,
+						"ip_cidr":  cidrs,
+					})
+				}
+			}
+			// 多路分流下若额外指定了未命中兜底 B 节点（OutboundTag 非空），追加在该入站规则末尾
+			if ch.OutboundTag != "" {
+				rules = append(rules, map[string]interface{}{
+					"inbound":  []string{ch.InboundTag},
+					"action":   "route",
+					"outbound": ch.OutboundTag,
+				})
+			}
+			continue
+		}
+		// 兼容旧版单路调用（Routes 为空时按 List + OutboundTag 生成，不产生兜底 catch-all）
 		suffixes, cidrs := splitDomainList(ch.List)
-		// 域名与 IP 必须拆成两条规则：sing-box 一条规则内多条件是 AND，
-		// 合写会导致两类流量都永不命中；两类都为空时不生成规则——绝不
-		// 生成无匹配条件的 catch-all，否则 A 的全部流量都会被送往 B。
 		if len(suffixes) > 0 {
 			rules = append(rules, map[string]interface{}{
 				"inbound":       []string{ch.InboundTag},
@@ -1013,10 +1206,7 @@ func SingBoxChainRules(chains []ChainInput) []map[string]interface{} {
 }
 
 // ParseChainList 解析链式清单：按行切分，去空行/# 注释、去 scheme、
-// 路径、端口、前导 *. 与前导点，校验每行是合法域名或 IP/CIDR，返回
-// 归一化后的两类清单。非法行按行号报错；解析后两类都为空时报错——
-// 绝不生成无匹配条件的 catch-all 规则（否则 A 的全部流量都会走 B）。
-// 上限 5000 行、256KB，超了直接拒绝，不让超大文本进配置。
+// 路径、端口、前导 *. 与前导点，校验每行是合法域名或 IP/CIDR。
 func ParseChainList(listText string) (suffixes, cidrs []string, err error) {
 	if len(listText) > 256*1024 {
 		return nil, nil, fmt.Errorf("链式清单超过 256KB 上限")
@@ -1033,7 +1223,6 @@ func ParseChainList(listText string) (suffixes, cidrs []string, err error) {
 		if idx := strings.Index(line, "://"); idx >= 0 {
 			line = line[idx+3:]
 		}
-		// CIDR/IP 先认：路径剥离在 "/" 处切，会把 1.2.3.0/24 的掩码切掉。
 		if isIPOrCIDR(line) {
 			cidrs = append(cidrs, line)
 			continue
@@ -1093,8 +1282,6 @@ func validChainDomain(s string) bool {
 	return true
 }
 
-// splitDomainList：生成器用的宽容版解析——非法清单直接产出空规则集
-// （不生成 catch-all），严格校验在创建/编辑接口做。
 func splitDomainList(listText string) (suffixes, cidrs []string) {
 	suffixes, cidrs, _ = ParseChainList(listText)
 	return suffixes, cidrs
@@ -1102,8 +1289,6 @@ func splitDomainList(listText string) (suffixes, cidrs []string) {
 
 // ---------- 全量配置 ----------
 
-// SingBoxFullConfig：组装 singbox.json。inbounds 为全部入站，endpoints 为
-// WireGuard 端点（为空时不写该键），outbounds 为链式出站（函数自动在首位补 direct）。
 func SingBoxFullConfig(inbounds []interface{}, endpoints []interface{}, outbounds []interface{}, rules []map[string]interface{}) map[string]interface{} {
 	outs := []interface{}{map[string]interface{}{"type": "direct", "tag": "direct"}}
 	outs = append(outs, outbounds...)
@@ -1111,9 +1296,6 @@ func SingBoxFullConfig(inbounds []interface{}, endpoints []interface{}, outbound
 	for _, r := range rules {
 		ruleList = append(ruleList, r)
 	}
-	// nil 切片进 JSON 是 null 不是 []：只有 WG 端点、没有 sing-box
-	// 入站时 inbounds 就是 nil，sing-box 校验会把 null 当类型错
-	// 拒绝（空数组才表示“没有入站”）。
 	if inbounds == nil {
 		inbounds = []interface{}{}
 	}
@@ -1134,12 +1316,8 @@ func SingBoxFullConfig(inbounds []interface{}, endpoints []interface{}, outbound
 
 // ---------- 新协议客户端链接 ----------
 
-// TUICLink：tuic v5 分享格式（v2rayNG/Streisand 通用）。
-// 自签证书所以 allow_insecure=1；拥塞算法与服务端一致写 bbr。
 func TUICLink(address string, port int, sni string, cfg TUICConfig, name string) string {
 	v := url.Values{}
-	// security=tls：TUIC 全程 TLS，官方方案无此参数，但部分客户端靠它
-	// 决定生成 TLS 块（与 Hy2Link 同理）。
 	v.Set("security", "tls")
 	v.Set("congestion_control", "bbr")
 	v.Set("udp_relay_mode", "native")
@@ -1158,16 +1336,13 @@ func TUICLink(address string, port int, sni string, cfg TUICConfig, name string)
 	return u.String()
 }
 
-// AnyTLSLink：anytls 分享格式。服务端 users 有 name，但客户端出站只认
-// password，所以链接里只放密码（与 sing-box anytls 出站字段一致）。
 func AnyTLSLink(address string, port int, sni string, cfg AnyTLSConfig, name string) string {
 	v := url.Values{}
-	// security=tls：AnyTLS 全程 TLS，理由同 Hy2Link/TUICLink。
 	v.Set("security", "tls")
 	if sni != "" {
 		v.Set("sni", sni)
 	}
-	v.Set("insecure", "1") // 自签证书
+	v.Set("insecure", "1")
 	u := &url.URL{
 		Scheme:   "anytls",
 		User:     url.UserPassword("", cfg.Password),
@@ -1179,11 +1354,7 @@ func AnyTLSLink(address string, port int, sni string, cfg AnyTLSConfig, name str
 	return strings.Replace(s, "anytls://:", "anytls://", 1)
 }
 
-// NaiveLink：Naive 没有通用 URL 分享格式，交付参考客户端的 JSON 配置
-// （与 WireGuard 节点交付整份配置文本同款做法，不是 URL，别贴进 URL 导入框）。
 func NaiveLink(cfg NaiveConfig, port int) string {
-	// 用户名/密码必须 URL 转义：密码里带 @ : / ? 时，裸拼的
-	// 链接会被客户端解析错 host、甚至截断密码。
 	proxyURL := &url.URL{
 		Scheme: "https",
 		User:   url.UserPassword(cfg.Username, cfg.Password),

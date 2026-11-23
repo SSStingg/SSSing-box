@@ -1,43 +1,50 @@
 package stats
 
 import (
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 // Poller queries nftables per-port counters and accumulates deltas into a sink.
 // 旧版走 xray stats API；sing-box 没有按入站累计的接口，改走 nft（见 nft.go）。
-// PortTags 由面板提供：端口 -> 入站 tag（"in-<id>"），因为 nft 只认端口不认 tag。
+// PortTags 由面板提供："tcp:443" / "udp:443" -> 入站 tag（"in-<id>"），因为
+// nft 只认（协议，端口）不认 tag；双协议节点（如 SS）一个 tag 对两个 key。
 type Poller struct {
-	PortTags func() map[int]string
+	PortTags func() map[string]string
 
 	mu       sync.Mutex
 	last     map[string][2]int64 // tag -> up, down
 	seen     map[string]bool     // tag 已建过基线（见 PollOnce）
-	lastPort map[string]int      // tag -> 建基线时的端口；端口一变就重建基线
+	lastPort map[string]string   // tag -> 建基线时的 "tcp:443" / "tcp:443,udp:443"；变了就重建基线
 	realtime map[string][2]int64 // tag -> current up/down rate (bytes/sec)
 	lastPoll time.Time
 	running  bool
 }
 
-func NewPoller(portTags func() map[int]string) *Poller {
-	return &Poller{PortTags: portTags, last: map[string][2]int64{}, seen: map[string]bool{}, lastPort: map[string]int{}, realtime: map[string][2]int64{}}
+func NewPoller(portTags func() map[string]string) *Poller {
+	return &Poller{PortTags: portTags, last: map[string][2]int64{}, seen: map[string]bool{}, lastPort: map[string]string{}, realtime: map[string][2]int64{}}
 }
 
-// QueryAll 读 nft 计数器并按端口映射成 tag -> up/down。
+// QueryAll 读 nft 计数器并按（协议，端口）映射成 tag -> up/down。
+// 双协议节点（如 SS）的两个 key 累加到同一个 tag。
 func (p *Poller) QueryAll() (map[string][2]int64, error) {
 	counters, err := Counters()
 	if err != nil {
 		return nil, err
 	}
-	tags := map[int]string{}
+	tags := map[string]string{}
 	if p.PortTags != nil {
 		tags = p.PortTags()
 	}
 	res := map[string][2]int64{}
-	for port, v := range counters {
-		if tag, ok := tags[port]; ok {
-			res[tag] = v
+	for pp, v := range counters {
+		if tag, ok := tags[pp]; ok {
+			cur := res[tag]
+			cur[0] += v[0]
+			cur[1] += v[1]
+			res[tag] = cur
 		}
 	}
 	return res, nil
@@ -50,12 +57,17 @@ func (p *Poller) PollOnce() (map[string][2]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	// tag -> 当前端口：基线必须按 (tag, 端口) 认，节点改端口后
-	// 旧端口计数器的值不能继续当新端口的基线。
-	tagPort := map[string]int{}
+	// tag -> 当前（协议，端口）集合：基线必须按 (tag, 协议端口集合) 认，
+	// 节点改端口后旧端口计数器的值不能继续当新端口的基线。
+	tagPort := map[string]string{}
 	if p.PortTags != nil {
-		for port, tag := range p.PortTags() {
-			tagPort[tag] = port
+		byTag := map[string][]string{}
+		for pp, tag := range p.PortTags() {
+			byTag[tag] = append(byTag[tag], pp)
+		}
+		for tag, keys := range byTag {
+			sort.Strings(keys)
+			tagPort[tag] = strings.Join(keys, ",")
 		}
 	}
 	now := time.Now()
@@ -132,7 +144,7 @@ func (p *Poller) Reset() {
 	defer p.mu.Unlock()
 	p.last = map[string][2]int64{}
 	p.seen = map[string]bool{}
-	p.lastPort = map[string]int{}
+	p.lastPort = map[string]string{}
 	p.lastPoll = time.Time{}
 }
 

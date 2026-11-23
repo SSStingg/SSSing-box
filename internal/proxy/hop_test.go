@@ -34,7 +34,7 @@ func TestRenderHopScript(t *testing.T) {
 	for _, want := range []string{
 		"table inet sssingbox-hop",
 		"type nat hook prerouting priority dstnat",
-		"type nat hook output priority dstnat",
+		"type nat hook output priority -100",
 		"prerouting ct state new udp dport 20000-40000 fib daddr type local counter redirect to :24443",
 		"output ct state new udp dport 20000-40000 fib daddr type local counter redirect to :24443",
 		"prerouting ct state new udp dport 50000-51000 fib daddr type local counter redirect to :24444",
@@ -62,5 +62,24 @@ func TestHy2LinkHop(t *testing.T) {
 	badLink := Hy2Link("1.2.3.4", 24443, "www.example.com", bad, "bad-node")
 	if strings.Contains(badLink, "mport=") || strings.Contains(badLink, "ports=") {
 		t.Fatalf("invalid hop range emitted into link: %s", badLink)
+	}
+}
+
+// 跳端口 nft 脚本：output 链不能用符号优先级 dstnat（nft 只认它在
+// prerouting 上），须用数字 -100，否则任何带跳端口的 HY2 节点都建不出来。
+func TestRenderHopScriptPriorities(t *testing.T) {
+	script := RenderHopScript([]HopRule{{Start: 20000, End: 20005, ToPort: 8445}})
+	lines := strings.Split(strings.TrimSpace(script), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("hop script should have 5 lines (table + 2 chains + 2 rules), got %d:\n%s", len(lines), script)
+	}
+	if !strings.Contains(lines[1], "hook prerouting priority dstnat") {
+		t.Fatalf("prerouting chain should keep priority dstnat:\n%s", script)
+	}
+	if !strings.Contains(lines[2], "hook output priority -100") {
+		t.Fatalf("output chain must use numeric priority -100, got:\n%s", script)
+	}
+	if strings.Contains(lines[2], "dstnat") {
+		t.Fatalf("output chain must not use dstnat:\n%s", script)
 	}
 }

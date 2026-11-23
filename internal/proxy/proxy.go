@@ -103,7 +103,7 @@ func VLESSLink(uuid, address string, port int, sni string, cfg VLESSConfig, name
 		}
 		v.Set("host", domain)
 		v.Set("allowInsecure", "1")
-		return fmt.Sprintf("vless://%s@%s?%s#%s", uuid, hostPort(domain, port), v.Encode(), qesc(name))
+		return fmt.Sprintf("vless://%s@%s?%s#%s", uuid, hostPort(domain, port), v.Encode(), url.PathEscape(name))
 	}
 	v := url.Values{}
 	v.Set("encryption", "none")
@@ -123,7 +123,7 @@ func VLESSLink(uuid, address string, port int, sni string, cfg VLESSConfig, name
 	if cfg.SpiderX != "" && cfg.SpiderX != "/" {
 		v.Set("spiderX", cfg.SpiderX)
 	}
-	return fmt.Sprintf("vless://%s@%s?%s#%s", uuid, hostPort(address, port), v.Encode(), qesc(name))
+	return fmt.Sprintf("vless://%s@%s?%s#%s", uuid, hostPort(address, port), v.Encode(), url.PathEscape(name))
 }
 
 // ---------- B-node link parsing ----------
@@ -170,8 +170,12 @@ func ParseBLink(link string) (*ParsedB, error) {
 		return parseSocksHTTP(link, "http", scheme == "https")
 	case "hysteria2", "hy2":
 		return parseHy2(link)
+	case "snell":
+		return parseSnell(link)
+	case "shadowtls":
+		return parseShadowTLS(link)
 	default:
-		return nil, fmt.Errorf("不支持的协议：%s（支持 vless/vmess/trojan/ss/socks/http/hysteria2）", scheme)
+		return nil, fmt.Errorf("不支持的协议：%s（支持 vless/vmess/trojan/ss/socks/http/hysteria2/snell/shadowtls）", scheme)
 	}
 }
 
@@ -247,12 +251,24 @@ func parseVLESS(link string) (*ParsedB, error) {
 		ss["wsSettings"] = map[string]interface{}{"path": q.Get("path"), "headers": map[string]interface{}{"Host": q.Get("host")}}
 	case "grpc":
 		ss["grpcSettings"] = map[string]interface{}{"serviceName": q.Get("serviceName")}
+	case "h2":
+		host := q.Get("host")
+		if host == "" {
+			host = q.Get("sni")
+		}
+		ss["httpSettings"] = map[string]interface{}{"path": q.Get("path"), "host": []string{host}}
+	case "httpupgrade":
+		host := q.Get("host")
+		if host == "" {
+			host = q.Get("sni")
+		}
+		ss["httpupgradeSettings"] = map[string]interface{}{"path": q.Get("path"), "host": host}
 	case "tcp":
 		if ht := q.Get("headerType"); ht == "http" {
 			ss["tcpSettings"] = map[string]interface{}{"header": map[string]interface{}{"type": "http", "request": map[string]interface{}{"headers": map[string]interface{}{"Host": []string{q.Get("host")}}, "path": []string{q.Get("path")}}}}
 		}
 	default:
-		return nil, fmt.Errorf("vless 传输 %s 暂不支持（支持 tcp/ws/grpc）", typ)
+		return nil, fmt.Errorf("vless 传输 %s 暂不支持（支持 tcp/ws/grpc/h2/httpupgrade）", typ)
 	}
 	out["streamSettings"] = ss
 	name := u.Fragment
@@ -332,12 +348,12 @@ func parseVMess(link string) (*ParsedB, error) {
 	if netw == "" {
 		netw = "tcp"
 	}
-	// 转换层只支持 tcp/ws/grpc：其他传输以前创建成功、Apply 时才炸全站，
-	// 现在创建时就拒绝（与 VLESS 解析器同款口径）。
+	// 转换层支持 tcp/ws/grpc/h2/httpupgrade/quic：其他传输以前创建成功、
+	// Apply 时才炸全站，现在创建时就拒绝（与 VLESS 解析器同款口径）。
 	switch netw {
-	case "tcp", "ws", "grpc":
+	case "tcp", "ws", "grpc", "h2", "httpupgrade", "quic":
 	default:
-		return nil, fmt.Errorf("VMess 传输 %s 暂不支持做 B 节点（仅 tcp/ws/grpc）", netw)
+		return nil, fmt.Errorf("VMess 传输 %s 暂不支持做 B 节点（仅 tcp/ws/grpc/h2/httpupgrade/quic）", netw)
 	}
 	ss := map[string]interface{}{"network": netw}
 	sec := "none"
@@ -395,6 +411,20 @@ func parseVMess(link string) (*ParsedB, error) {
 		ss["wsSettings"] = map[string]interface{}{"path": v.Path, "headers": map[string]interface{}{"Host": v.Host}}
 	case "grpc":
 		ss["grpcSettings"] = map[string]interface{}{"serviceName": v.Path}
+	case "h2":
+		host := v.Host
+		if host == "" {
+			host = v.SNI
+		}
+		ss["httpSettings"] = map[string]interface{}{"path": v.Path, "host": []string{host}}
+	case "httpupgrade":
+		host := v.Host
+		if host == "" {
+			host = v.SNI
+		}
+		ss["httpupgradeSettings"] = map[string]interface{}{"path": v.Path, "host": host}
+	case "quic":
+		ss["quicSettings"] = map[string]interface{}{}
 	case "tcp":
 		if v.Type == "http" {
 			ss["tcpSettings"] = map[string]interface{}{"header": map[string]interface{}{"type": "http", "request": map[string]interface{}{"headers": map[string]interface{}{"Host": []string{v.Host}}, "path": []string{v.Path}}}}
@@ -457,7 +487,7 @@ func parseTrojan(link string) (*ParsedB, error) {
 		} else {
 			tls["serverName"] = u.Hostname()
 		}
-		if q.Get("allowInsecure") == "1" {
+		if q.Get("allowInsecure") == "1" || q.Get("insecure") == "1" {
 			tls["allowInsecure"] = true
 		}
 		if v := q.Get("fp"); v != "" {
@@ -473,9 +503,21 @@ func parseTrojan(link string) (*ParsedB, error) {
 	switch typ {
 	case "ws":
 		ss["wsSettings"] = map[string]interface{}{"path": q.Get("path"), "headers": map[string]interface{}{"Host": q.Get("host")}}
+	case "h2":
+		host := q.Get("host")
+		if host == "" {
+			host = q.Get("sni")
+		}
+		ss["httpSettings"] = map[string]interface{}{"path": q.Get("path"), "host": []string{host}}
+	case "httpupgrade":
+		host := q.Get("host")
+		if host == "" {
+			host = q.Get("sni")
+		}
+		ss["httpupgradeSettings"] = map[string]interface{}{"path": q.Get("path"), "host": host}
 	case "tcp":
 	default:
-		return nil, fmt.Errorf("trojan 传输 %s 暂不支持（支持 tcp/ws）", typ)
+		return nil, fmt.Errorf("trojan 传输 %s 暂不支持（支持 tcp/ws/h2/httpupgrade）", typ)
 	}
 	out := map[string]interface{}{
 		"protocol": "trojan",
@@ -491,6 +533,108 @@ func parseTrojan(link string) (*ParsedB, error) {
 	return &ParsedB{Protocol: "trojan", Name: name, Outbound: out}, nil
 }
 
+// parseSnell 解析面板自己的 Snell 分享链接：
+// snell://<psk>@<host>:<port>?version=<4|6>&obfs=http&obfs-host=<host>#<name>（v5）
+// snell://<psk>@<host>:<port>?version=6&mode=<default|unshaped|unsafe-raw>#<name>（v6）
+// 链接里的 version 是 Shadowrocket/mihomo 口径：4 = 面板 v5，6 = 面板 v6；
+// 5 也按 v5 收（个别工具这么写）。version 存面板口径（5|6），
+// 线路版本号（v5 写 4）由 SingBoxBOutbound 转换。返回 sing-box 形态的出站对象（与 hy2 同路）。
+func parseSnell(link string) (*ParsedB, error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil, err
+	}
+	psk := u.User.Username()
+	port, _ := strconv.Atoi(u.Port())
+	if psk == "" || u.Hostname() == "" || port == 0 {
+		return nil, fmt.Errorf("snell 链接缺少密钥/地址/端口")
+	}
+	ver := 5
+	switch q := u.Query(); q.Get("version") {
+	case "", "4", "5":
+		ver = 5
+	case "6":
+		ver = 6
+	default:
+		return nil, fmt.Errorf("不支持的 Snell 版本：%s", q.Get("version"))
+	}
+	ob := map[string]interface{}{
+		"type":        "snell",
+		"server":      u.Hostname(),
+		"server_port": port,
+		"version":     ver,
+		"psk":         psk,
+	}
+	if ver == 5 && u.Query().Get("obfs") == "http" {
+		host := u.Query().Get("obfs-host")
+		if host == "" {
+			host = "bing.com"
+		}
+		ob["obfs_mode"] = "http"
+		ob["obfs_host"] = host
+	}
+	if ver == 6 {
+		if m := u.Query().Get("mode"); m != "" {
+			ob["mode"] = m
+		}
+	}
+	name := u.Fragment
+	if name == "" {
+		name = "snell-" + u.Hostname()
+	}
+	return &ParsedB{Protocol: "snell", Name: name, Outbound: ob}, nil
+}
+
+// shadowtls://<密码>@<host>:<port>?version=3&handshake=<站>&ss-method=<方法>&ss-password=<内层密码>#<名字>
+// 面板自定格式（非公开标准，与 snell:// 同路）：version 省略默认 3，
+// handshake 省略默认 gateway.icloud.com，ss-method 省略默认 2022-blake3-aes-128-gcm。
+// 内层 SS 密码必填——没有它 SS 出站无法认证。存的是 sing-box 形态的出站对象，
+// 由 SingBoxBOutbound 转成 SS 出站 + shadowtls detour 出站两个。
+func parseShadowTLS(link string) (*ParsedB, error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil, err
+	}
+	pw := u.User.Username()
+	port, _ := strconv.Atoi(u.Port())
+	if pw == "" || u.Hostname() == "" || port == 0 {
+		return nil, fmt.Errorf("shadowtls 链接缺少密码/地址/端口")
+	}
+	q := u.Query()
+	switch q.Get("version") {
+	case "", "3":
+	default:
+		return nil, fmt.Errorf("不支持的 ShadowTLS 版本：%s（仅支持 v3）", q.Get("version"))
+	}
+	handshake := q.Get("handshake")
+	if handshake == "" {
+		handshake = "gateway.icloud.com"
+	}
+	method := q.Get("ss-method")
+	if method == "" {
+		method = "2022-blake3-aes-128-gcm"
+	}
+	ssPw := q.Get("ss-password")
+	if ssPw == "" {
+		return nil, fmt.Errorf("shadowtls 链接缺少内层 SS 密码（ss-password）")
+	}
+	ob := map[string]interface{}{
+		"type":        "shadowtls",
+		"server":      u.Hostname(),
+		"server_port": port,
+		"version":     3,
+		"password":    pw,
+		"handshake":   handshake,
+		"ss_method":   method,
+		"ss_password": ssPw,
+	}
+	name := u.Fragment
+	if name == "" {
+		name = "shadowtls-" + u.Hostname()
+	}
+	return &ParsedB{Protocol: "shadowtls", Name: name, Outbound: ob}, nil
+}
+
 func parseSS(link string) (*ParsedB, error) {
 	rest := strings.TrimPrefix(link, "ss://")
 	// forms: ss://base64(method:pass@host:port)#name  OR  ss://base64(method:pass)@host:port#name
@@ -499,6 +643,10 @@ func parseSS(link string) (*ParsedB, error) {
 		frag = rest[i+1:]
 		rest = rest[:i]
 	}
+	if i := strings.Index(rest, "?"); i >= 0 {
+		rest = rest[:i]
+	}
+	rest = strings.TrimSuffix(rest, "/")
 	var method, pass, host string
 	var port int
 	if strings.Contains(rest, "@") {

@@ -75,6 +75,7 @@ const HopTable = "sssingbox-hop"
 //     on the NIC for this host's IP.
 //   - output: locally generated packets to this host's own IP — a client
 //     running on the same machine (and the panel's own self-test).
+//
 // Without the output chain, a same-machine client would bypass the
 // redirect entirely (local traffic never traverses prerouting).
 // fib daddr type local is load-bearing on both: without it, the output
@@ -89,7 +90,7 @@ func RenderHopScript(rules []HopRule) string {
 	var b strings.Builder
 	b.WriteString("table inet " + HopTable + "\n")
 	b.WriteString("chain inet " + HopTable + " prerouting { type nat hook prerouting priority dstnat; policy accept; }\n")
-	b.WriteString("chain inet " + HopTable + " output { type nat hook output priority dstnat; policy accept; }\n")
+	b.WriteString("chain inet " + HopTable + " output { type nat hook output priority -100; policy accept; }\n")
 	for _, r := range rules {
 		fmt.Fprintf(&b, "add rule inet %s prerouting ct state new udp dport %d-%d fib daddr type local counter redirect to :%d\n", HopTable, r.Start, r.End, r.ToPort)
 		fmt.Fprintf(&b, "add rule inet %s output ct state new udp dport %d-%d fib daddr type local counter redirect to :%d\n", HopTable, r.Start, r.End, r.ToPort)

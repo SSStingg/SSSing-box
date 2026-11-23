@@ -52,3 +52,64 @@ func TestSNIListNoCloudflare(t *testing.T) {
 		t.Fatalf("池子应为 30 个，得到 %d", len(SNIList))
 	}
 }
+
+func TestRecommendSNIExcluding(t *testing.T) {
+	// 排除多个域名后，随机结果永不命中被排除的。
+	for i := 0; i < 200; i++ {
+		c := RecommendSNIExcluding("www.samsung.com", "www.intel.com", "bing.com", "www.bing.com")
+		if c.Domain == "www.samsung.com" || c.Domain == "www.intel.com" || c.Domain == "bing.com" || c.Domain == "www.bing.com" {
+			t.Fatalf("excluded domain returned: %s", c.Domain)
+		}
+	}
+	// 全部排除时回退到 SNIList[0]，不 panic、不返回空。
+	c := RecommendSNIExcluding(poolDomains()...)
+	if c.Domain == "" {
+		t.Fatal("empty domain when pool exhausted")
+	}
+}
+
+func poolDomains() []string {
+	ds := make([]string, 0, len(SNIList))
+	for _, c := range SNIList {
+		ds = append(ds, c.Domain)
+	}
+	return ds
+}
+
+func TestRandomSnellObfsHost(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		h := RandomSnellObfsHost()
+		if h == "" || h == "bing.com" || h == "www.bing.com" {
+			t.Fatalf("bad snell obfs host: %q", h)
+		}
+		found := false
+		for _, c := range SNIList {
+			if c.Domain == h {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("host not in SNI pool: %q", h)
+		}
+		seen[h] = true
+	}
+	if len(seen) < 2 {
+		t.Fatal("random snell host never varies")
+	}
+}
+
+func TestRandomHandshakeHost(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		h := RandomHandshakeHost()
+		if h == "" || h == "gateway.icloud.com" || h == "bing.com" || h == "www.bing.com" {
+			t.Fatalf("bad handshake host: %q", h)
+		}
+		seen[h] = true
+	}
+	if len(seen) < 2 {
+		t.Fatal("random handshake host never varies")
+	}
+}

@@ -4,8 +4,10 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
@@ -24,20 +26,15 @@ import (
 
 // App wires store, cores and config generation.
 type App struct {
-	Store *store.Store
-	Mgr   *cores.Manager
-	Sup   *cores.Supervisor
-	// applyMu 串行化 ApplyAll：用户操作与后台配额循环不得交错写配置、
-	// 校验与重启，否则两份配置会互相覆盖。
+	Store   *store.Store
+	Mgr     *cores.Manager
+	Sup     *cores.Supervisor
 	applyMu sync.Mutex
 	Dir     string
 
+	ipMu          sync.Mutex
 	publicIPCache string
 
-	// IPv6 cache is memory-only with a TTL: unlike the IPv4 address,
-	// a DHCPv6 address can change, so a permanently cached value (or
-	// a value persisted in settings) would go stale and the IPv6
-	// node link would silently point at a dead address.
 	publicIPv6Cache   string
 	publicIPv6Fetched time.Time
 }
@@ -65,9 +62,6 @@ func (a *App) CertDir() string {
 }
 
 func writeAtomic(path string, data []byte) error {
-	// 唯一临时文件 + 原子重命名：并发 Apply 不会互相截断同一个 .tmp；
-	// 0600：这里写的是含全部节点密钥的 singbox.json 与证书私钥，
-	// 同机其他本地用户不应可读。
 	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
@@ -89,8 +83,6 @@ func writeAtomic(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
-// mustConfig：入站 Config 解析失败时按节点名报错，而不是吞掉错误继续
-// 用零值生成配置（零值曾导致无认证代理等静默错配，且报错里没有节点名）。
 func mustConfig(in *store.Inbound, target interface{}) error {
 	if err := json.Unmarshal([]byte(in.Config), target); err != nil {
 		return fmt.Errorf("节点 %s 配置解析失败：%w", in.Name, err)
@@ -103,10 +95,6 @@ func toJSON(v interface{}) []byte {
 	return b
 }
 
-// genRealityKeypair generates an X25519 keypair in xray's own format:
-// base64url WITHOUT padding (43 chars), exactly like `xray x25519` output
-// (verified on the real binary: keys contain - and _, never + / or =).
-// sing-box Reality uses the same key format, so the generator is unchanged.
 func genRealityKeypair() (priv, pub string, err error) {
 	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -117,7 +105,6 @@ func genRealityKeypair() (priv, pub string, err error) {
 	return priv, pub, nil
 }
 
-// tlsModeDomain：TLS 档的域名，配置里没填就用节点 SNI。
 func tlsModeDomain(cfgDomain, sni string) string {
 	if cfgDomain != "" {
 		return cfgDomain
@@ -125,14 +112,6 @@ func tlsModeDomain(cfgDomain, sni string) string {
 	return sni
 }
 
-// ApplySingBox builds the ONE singbox.json for all sing-box nodes
-// plus chain outbounds/rules, validates it
-// with `sing-box check`, and restarts sing-box. Old xray/hysteria configs
-// are no longer generated; retiring those processes is ApplyAll's job,
-// AFTER this succeeds, so a failed apply never leaves nodes down.
-// listenConflict：两个监听是否会抢同一个端口。空/::/0.0.0.0 都是
-// 通配（生成器默认监听 ::），通配与任何监听都冲突；两个具体的
-// 不同地址可以共存，同地址则冲突。
 func listenConflict(a, b string) bool {
 	wa := a == "" || a == "::" || a == "0.0.0.0"
 	wb := b == "" || b == "::" || b == "0.0.0.0"
@@ -142,9 +121,6 @@ func listenConflict(a, b string) bool {
 	return a == b
 }
 
-// checkRealityDest：Reality 握手目标必须是 host:port 且端口合法。
-// 空 dest 也报错：归一化会从 SNI 补 dest，走到 Apply 时 dest
-// 还空着说明这条记录根本没经过归一化，握手 server 为空必死。
 func checkRealityDest(nodeName, dest string) error {
 	host, portStr, err := net.SplitHostPort(dest)
 	if err != nil || host == "" {
@@ -157,11 +133,6 @@ func checkRealityDest(nodeName, dest string) error {
 	return nil
 }
 
-// checkPortConflicts：启用的同传输入站之间，同端口 + 冲突监听
-// 必须在生成前拦住——否则 sing-box 起不来，整个 Apply 白白回滚。
-// 创建/编辑时已拦重复端口，这里防的是直接改库、克隆竞态等旁路。
-// TCP 与 UDP 端口是两套编号（2026-11-12）：不同传输的节点同端口
-// 不冲突，只拦同传输的。
 func checkPortConflicts(inbounds []*store.Inbound, group string) error {
 	type claim struct {
 		name, listen, protocol string
@@ -176,11 +147,17 @@ func checkPortConflicts(inbounds []*store.Inbound, group string) error {
 		}
 		_ = json.Unmarshal([]byte(in.Config), &raw)
 		claims[in.Port] = append(claims[in.Port], claim{in.Name, raw.Listen, in.Protocol})
+		if in.Protocol == "shadowtls" {
+			var stc proxy.ShadowTLSConfig
+			if json.Unmarshal([]byte(in.Config), &stc) == nil && stc.InnerPort > 0 {
+				claims[stc.InnerPort] = append(claims[stc.InnerPort], claim{in.Name + "(内层SS)", "127.0.0.1", "ss"})
+			}
+		}
 	}
 	for port, cs := range claims {
 		for i := 0; i < len(cs); i++ {
 			for j := i + 1; j < len(cs); j++ {
-				if store.UDPOnlyProtocol(cs[i].protocol) != store.UDPOnlyProtocol(cs[j].protocol) {
+				if !store.ProtocolsShareTransport(cs[i].protocol, cs[j].protocol) {
 					continue
 				}
 				if listenConflict(cs[i].listen, cs[j].listen) {
@@ -217,15 +194,11 @@ func (a *App) ApplySingBox() error {
 			if err := mustConfig(in, &cfg); err != nil {
 				return err
 			}
-			// 生成器对未知 Mode 会静默走证书分支：Apply 层按节点名拦住。
 			switch cfg.Mode {
 			case "", "reality", "ws", "h2", "httpupgrade":
 			default:
 				return fmt.Errorf("节点 %s：不支持的 VLESS 传输模式 %s", in.Name, cfg.Mode)
 			}
-			// Reality 目标地址必须是 host:port：生成器的 SplitHostPort
-			// 失败时静默按 host 全名 + 443 处理，写错的 dest（如带
-			// 错端口、缺端口）会变成指向错误目标的握手，排障极难。
 			if cfg.Mode == "" || cfg.Mode == "reality" {
 				if err := checkRealityDest(in.Name, cfg.Dest); err != nil {
 					return err
@@ -278,7 +251,6 @@ func (a *App) ApplySingBox() error {
 			if err := mustConfig(in, &cfg); err != nil {
 				return err
 			}
-			// 空凭证会变成无认证公开代理：Apply 层硬拦，不让它落盘。
 			if cfg.User == "" || cfg.Pass == "" {
 				return fmt.Errorf("节点 %s：SOCKS 必须设置用户名和密码，空凭证会变成无认证公开代理", in.Name)
 			}
@@ -329,8 +301,6 @@ func (a *App) ApplySingBox() error {
 			if err := mustConfig(in, &cfg); err != nil {
 				return err
 			}
-			// 限速写错（如 "abc"、"-5"）时生成器静默丢掉该项，
-			// 节点变成不限速——用户以为限了、实际没限。在此拦住。
 			for _, field := range []struct {
 				name, val string
 			}{{"上行限速", cfg.UpMbps}, {"下行限速", cfg.DownMbps}} {
@@ -344,13 +314,40 @@ func (a *App) ApplySingBox() error {
 			}
 			certPath := filepath.Join(a.CertDir(), "hy2-"+in.ID+".pem")
 			keyPath := filepath.Join(a.CertDir(), "hy2-"+in.ID+".key")
-			// 证书与私钥必须配对才复用：只 Stat 证书时，换掉一边的错配对
-			// 会让之后每次 Apply 都卡在 sing-box 校验，全部更新冻结。
-			if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
-				cn := in.SNI
-				if cn == "" {
-					cn = "localhost"
+			cn := in.SNI
+			if cn == "" {
+				cn = "localhost"
+			}
+			needCert := true
+			if b, err := os.ReadFile(certPath); err == nil {
+				if block, _ := pem.Decode(b); block != nil {
+					if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
+						nameOK := false
+						if ip := net.ParseIP(cn); ip != nil {
+							for _, cip := range cert.IPAddresses {
+								if cip.Equal(ip) {
+									nameOK = true
+									break
+								}
+							}
+						} else {
+							nameOK = cert.Subject.CommonName == cn
+							for _, dn := range cert.DNSNames {
+								if dn == cn {
+									nameOK = true
+									break
+								}
+							}
+						}
+						if nameOK && cert.NotAfter.After(time.Now().Add(7*24*time.Hour)) {
+							if _, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+								needCert = false
+							}
+						}
+					}
 				}
+			}
+			if needCert {
 				if err := proxy.GenSelfSignedCert(certPath, keyPath, cn); err != nil {
 					return fmt.Errorf("生成 hy2 证书失败：%w", err)
 				}
@@ -389,7 +386,6 @@ func (a *App) ApplySingBox() error {
 			if err := mustConfig(in, &cfg); err != nil {
 				return err
 			}
-			// Naive 必须用 CA 证书：自签会破坏它的设计目的，绝不偷偷自签。
 			if cfg.CertFile == "" || cfg.KeyFile == "" {
 				return fmt.Errorf("Naive 节点 %s 缺少 CA 证书，请先上传证书", in.Name)
 			}
@@ -405,8 +401,6 @@ func (a *App) ApplySingBox() error {
 			if err := mustConfig(in, &cfg); err != nil {
 				return err
 			}
-			// 版本与 PSK 在创建/编辑时已归一化，这里按节点名再拦一次
-			// 非法值，免得脏数据让整站 Apply 冻结。
 			if cfg.Version != 5 && cfg.Version != 6 {
 				return fmt.Errorf("节点 %s：不支持的 Snell 版本 %d", in.Name, cfg.Version)
 			}
@@ -438,8 +432,6 @@ func (a *App) ApplySingBox() error {
 			if err := mustConfig(in, &cfg); err != nil {
 				return err
 			}
-			// ClientIP 必须是合法 CIDR：留空或写成裸 IP 时，
-			// allowed_ips 非法或 peer 永远匹配不上（P1-26）。
 			if cfg.ClientIP == "" {
 				return fmt.Errorf("WireGuard 节点 %s 未设置客户端 IP", in.Name)
 			}
@@ -448,8 +440,6 @@ func (a *App) ApplySingBox() error {
 			}
 			endpoints = append(endpoints, proxy.SingBoxWGEndpoint("wg-"+in.ID, in.Port, cfg))
 		case "dokodemo":
-			// 退役协议：绝不能因单个历史节点冻结全量 Apply。直接停用落盘，
-			// 列表里显示已停用（真实状态），而不是让所有更新都失败。
 			in.Enabled = false
 			if err := a.Store.UpsertInbound(in); err != nil {
 				return err
@@ -460,53 +450,109 @@ func (a *App) ApplySingBox() error {
 		}
 		enabledAny = true
 	}
-	// chains: A must be an enabled vless inbound; B converts to a sing-box
-	// outbound. A converter failure aborts BEFORE writing config: a chain
-	// that silently doesn't route is worse than a loud failure.
+
+	// 链式与多节点分流：支持除 WireGuard 外全部入站协议做 A 节点，B 出站按 BNode ID 去重复用。
 	var chainOutbounds []interface{}
 	var chainInputs []proxy.ChainInput
+	emittedB := map[string]string{} // bnodeID -> outbound tag
+
+	ensureBOutbound := func(chainName string, bn *store.BNode) (string, error) {
+		if tag, ok := emittedB[bn.ID]; ok {
+			return tag, nil
+		}
+		tag := "chain-b-" + bn.ID
+		obs, err := proxy.SingBoxBOutbound(bn.Protocol, bn.Config, tag)
+		if err != nil {
+			return "", fmt.Errorf("链式 %s 的 B 节点 %s 转换失败：%w（配置未写入，旧配置继续跑）", chainName, bn.Name, err)
+		}
+		emittedB[bn.ID] = tag
+		// ShadowTLS 一个 B 节点出两个出站（SS 在前、detour 在后），路由指向 SS 的 tag；
+		// 其余协议只有一个出站，循环照样成立。
+		for _, ob := range obs {
+			chainOutbounds = append(chainOutbounds, ob)
+		}
+		return tag, nil
+	}
+
 	for _, ch := range chains {
 		if !ch.Enabled {
 			continue
 		}
 		in, err := a.Store.GetInbound(ch.InboundID)
 		if err != nil {
-			// 引用已删：删 A/B 时本应级联，残留的孤儿链自动停用，
-			// 免得列表里永远显示启用却永不生效（行为测试 2.5）。
-			// 注意与下面区分：A 只是停用/改协议时链式保持启用，
-			// 恢复 A 后路由自动回来，不在这里动它。
-			ch.Enabled = false
-			_ = a.Store.UpsertChain(ch)
+			return fmt.Errorf("链式 %s 的入口 A 节点不存在（可能已被删除），请删除该链式或重新选择入口", ch.Name)
+		}
+		if !in.Enabled || !proxy.CanBeChainA(in.Protocol) {
 			continue
 		}
-		if !in.Enabled || in.Protocol != "vless" {
+		inTag := proxy.ChainInboundTag(in.ID, in.Protocol)
+
+		if ch.Mode == "direct" {
+			bn, err := a.Store.GetBNode(ch.BNodeID)
+			if err != nil {
+				return fmt.Errorf("链式 %s 的落地 B 节点不存在（可能已被删除），请重新选择 B 节点", ch.Name)
+			}
+			outTag, err := ensureBOutbound(ch.Name, bn)
+			if err != nil {
+				return err
+			}
+			chainInputs = append(chainInputs, proxy.ChainInput{
+				InboundTag:  inTag,
+				OutboundTag: outTag,
+				Direct:      true,
+			})
 			continue
 		}
-		bn, err := a.Store.GetBNode(ch.BNodeID)
-		if err != nil {
-			ch.Enabled = false
-			_ = a.Store.UpsertChain(ch)
-			continue
+
+		// 多路分流模式
+		var rtInputs []proxy.ChainRouteInput
+		for i, r := range ch.Routes {
+			bn, err := a.Store.GetBNode(r.BNodeID)
+			if err != nil {
+				return fmt.Errorf("链式 %s 第 %d 组的 B 节点不存在（可能已被删除），请删除该组或重新选择 B 节点", ch.Name, i+1)
+			}
+			outTag, err := ensureBOutbound(ch.Name, bn)
+			if err != nil {
+				return err
+			}
+			rtInputs = append(rtInputs, proxy.ChainRouteInput{
+				OutboundTag: outTag,
+				List:        r.List,
+			})
 		}
-		tag := "chain-" + ch.ID
-		ob, err := proxy.SingBoxBOutbound(bn.Protocol, bn.Config, tag)
-		if err != nil {
-			return fmt.Errorf("链式 %s 的 B 节点转换失败：%w（配置未写入，旧配置继续跑）", ch.Name, err)
+		fbTag := ""
+		if ch.BNodeID != "" {
+			bn, err := a.Store.GetBNode(ch.BNodeID)
+			if err != nil {
+				return fmt.Errorf("链式 %s 的兜底 B 节点不存在（可能已被删除），请重新选择或清空兜底", ch.Name)
+			}
+			fbTag, err = ensureBOutbound(ch.Name, bn)
+			if err != nil {
+				return err
+			}
 		}
-		chainOutbounds = append(chainOutbounds, ob)
-		chainInputs = append(chainInputs, proxy.ChainInput{InboundTag: "in-" + ch.InboundID, OutboundTag: tag, List: ch.List, Direct: ch.Mode == "direct"})
+		if len(rtInputs) == 0 {
+			if fbTag == "" {
+				return fmt.Errorf("链式 %s 没有可用的分流组且未设置兜底 B 节点，无法生效，请检查分流组与 B 节点", ch.Name)
+			}
+			return fmt.Errorf("链式 %s 未配置任何分流组，请添加分流组或改为全局直通模式", ch.Name)
+		}
+		chainInputs = append(chainInputs, proxy.ChainInput{
+			InboundTag:  inTag,
+			OutboundTag: fbTag,
+			Routes:      rtInputs,
+			Direct:      false,
+		})
 	}
+
 	rules := proxy.SingBoxChainRules(chainInputs)
 	cfg := proxy.SingBoxFullConfig(sbInbounds, endpoints, chainOutbounds, rules)
 	cfgPath := filepath.Join(a.ConfigDir(), "singbox.json")
-	// 先写临时文件、校验通过后再上岗：坏配置绝不覆盖盘上正在跑的那份。
-	// 以前是先落盘后校验，校验失败时坏配置残留，下次重启直接起不来。
 	staging := cfgPath + ".staging"
 	if err := writeAtomic(staging, toJSON(cfg)); err != nil {
 		return err
 	}
 	if !a.Mgr.Installed("sing-box") {
-		// 核心还没下载：配置先落盘等安装，无二进制可校验。
 		if err := os.Rename(staging, cfgPath); err != nil {
 			return err
 		}
@@ -519,14 +565,10 @@ func (a *App) ApplySingBox() error {
 		a.Sup.Stop("sing-box")
 		return nil
 	}
-	// 先校验再上岗：配置有问题时老进程继续跑，不被坏配置掀翻；
-	// sing-box 的具体报错要带回来，否则只剩 exit status 1 没法定位。
 	if out, err := exec.Command(a.Mgr.BinPath("sing-box"), "check", "-c", staging).CombinedOutput(); err != nil {
 		_ = os.Remove(staging)
 		return fmt.Errorf("sing-box 配置校验失败：%v：%s", err, strings.TrimSpace(string(out)))
 	}
-	// 备份正在跑的配置：重启失败（check 验不出的运行时问题，如端口被占）
-	// 时可回滚，不让节点掀翻后无处可回。
 	prevPath := cfgPath + ".prev"
 	if b, err := os.ReadFile(cfgPath); err == nil {
 		_ = os.WriteFile(prevPath, b, 0600)
@@ -538,7 +580,6 @@ func (a *App) ApplySingBox() error {
 		rollbackSingBox(a, cfgPath, prevPath)
 		return fmt.Errorf("启动 sing-box 失败（已回滚上一份配置）：%w", err)
 	}
-	// check 只验语法不验运行：重启后确认进程真活着，否则回滚。
 	alive := false
 	for i := 0; i < 15; i++ {
 		if a.Sup.Status("sing-box").Running {
@@ -554,7 +595,6 @@ func (a *App) ApplySingBox() error {
 	return nil
 }
 
-// rollbackSingBox 把上一份配置搬回来并重启（上一份不存在时不做任何事）。
 func rollbackSingBox(a *App, cfgPath, prevPath string) {
 	if _, err := os.Stat(prevPath); err != nil {
 		return
@@ -563,9 +603,6 @@ func rollbackSingBox(a *App, cfgPath, prevPath string) {
 	_ = a.Sup.Restart("sing-box", []string{"run", "-c", cfgPath})
 }
 
-// stopRetiredCores stops xray and per-node hysteria processes. Binaries
-// stay on disk until the user confirms deletion; the panel just never starts
-// them again. Called only after ApplySingBox succeeds.
 func (a *App) stopRetiredCores() {
 	a.Sup.Stop("xray")
 	for _, name := range a.Sup.Names() {
@@ -575,11 +612,6 @@ func (a *App) stopRetiredCores() {
 	}
 }
 
-// ApplyAll regenerates the sing-box config and restarts what is needed.
-// Order matters: sing-box first, then retire old cores —
-// a failed sing-box apply leaves the old cores running as fallback.
-// ApplyAll calls serialize on applyMu: user PUTs and the background
-// quota loop must not interleave config writes and restarts.
 func (a *App) ApplyAll() error {
 	a.applyMu.Lock()
 	defer a.applyMu.Unlock()
@@ -594,34 +626,46 @@ func (a *App) ApplyAll() error {
 	return hopErr
 }
 
-// PublicIPv6 returns the public IPv6, refetching at most once an hour.
-// Returns "" when the machine has no IPv6 egress.
 func (a *App) PublicIPv6() string {
+	a.ipMu.Lock()
 	if a.publicIPv6Cache != "" && time.Since(a.publicIPv6Fetched) < time.Hour {
-		return a.publicIPv6Cache
-	}
-	if ip := sysinfo.PublicIPv6(); ip != "" {
-		a.publicIPv6Cache = ip
-		a.publicIPv6Fetched = time.Now()
+		ip := a.publicIPv6Cache
+		a.ipMu.Unlock()
 		return ip
 	}
-	// Transient fetch failure: keep serving the last known address
-	// rather than dropping the IPv6 row and links for an hour.
-	return a.publicIPv6Cache
+	cached := a.publicIPv6Cache
+	a.ipMu.Unlock()
+
+	if ip := sysinfo.PublicIPv6(); ip != "" {
+		a.ipMu.Lock()
+		a.publicIPv6Cache = ip
+		a.publicIPv6Fetched = time.Now()
+		a.ipMu.Unlock()
+		return ip
+	}
+	return cached
 }
 
-// PublicIP returns cached public IPv4, fetching once if needed.
 func (a *App) PublicIP() string {
+	a.ipMu.Lock()
 	if a.publicIPCache != "" {
-		return a.publicIPCache
+		ip := a.publicIPCache
+		a.ipMu.Unlock()
+		return ip
 	}
+	a.ipMu.Unlock()
+
 	if v := a.Store.GetSetting("public_ip"); v != "" {
+		a.ipMu.Lock()
 		a.publicIPCache = v
+		a.ipMu.Unlock()
 		return v
 	}
 	ip := sysinfo.PublicIPv4()
 	if ip != "" {
+		a.ipMu.Lock()
 		a.publicIPCache = ip
+		a.ipMu.Unlock()
 		_ = a.Store.SetSetting("public_ip", ip)
 	}
 	return ip

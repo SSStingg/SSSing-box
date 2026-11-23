@@ -41,9 +41,18 @@ type credentials struct {
 
 func credPath(dataDir string) string { return filepath.Join(dataDir, ".cli-credentials") }
 
+// envCompat 同时读取全大写 SSSINGBOX_* 与旧混合大小写 SSSingBOX_* 两种拼写，
+// 全大写优先，未设时回落旧拼写，保证老脚本和已配环境变量平滑兼容。
+func envCompat(upper, mixed string) string {
+	if v := os.Getenv(upper); v != "" {
+		return v
+	}
+	return os.Getenv(mixed)
+}
+
 func loadCredentials(dataDir string) (credentials, error) {
-	if u := os.Getenv("SSSINGBOX_USER"); u != "" {
-		if p := os.Getenv("SSSINGBOX_PASS"); p != "" {
+	if u := envCompat("SSSINGBOX_USER", "SSSingBOX_USER"); u != "" {
+		if p := envCompat("SSSINGBOX_PASS", "SSSingBOX_PASS"); p != "" {
 			return credentials{Username: u, Password: p}, nil
 		}
 	}
@@ -65,7 +74,6 @@ func saveCredentials(dataDir string, c credentials) error {
 
 // client：带登录态的面板 API 客户端。先试 HTTP（双协议监听下本地 HTTP 一直通），
 // 不通再试 HTTPS（忽略自签证书校验，只走本机回环）。
-// Username/Password 留给菜单“查看登录信息”用，只显示在用户自己的终端上。
 type client struct {
 	base     string
 	http     *http.Client
@@ -151,7 +159,6 @@ type nodeRow struct {
 }
 
 func (c *client) listNodes() ([]nodeRow, error) {
-	// /api/inbounds GET 返回行数组（data 本身就是数组，不包在对象里）。
 	var body io.Reader
 	req, _ := http.NewRequest("GET", c.base+"/api/inbounds", body)
 	resp, err := c.http.Do(req)
@@ -216,9 +223,6 @@ func createPayload(protocol string, port int, name, sni string, advanced map[str
 }
 
 // resolvePanelPort：未显式传 -port 时，从数据库读面板实际端口。
-// 面板里改端口后，数据库的 panel_port 与服务文件都会同步更新，CLI 读库
-// 即可自动识别新端口（修：面板改端口后 CLI 还连旧端口 18081 的问题）。
-// 只读打开（mode=ro）：库不存在时不创建、不写盘，读失败一律回落 18081。
 func resolvePanelPort(dataDir string) int {
 	const fallback = 18081
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "sssingbox.db")+"?mode=ro")
@@ -242,15 +246,19 @@ func Run(args []string) int {
 		fmt.Println("用法：直接运行 sssingbox 进入交互菜单（节点、内核、面板信息、账号密码端口都在里面）。旧子命令仍可用：menu / node / status / sub / core / admin / login / version")
 		return 2
 	}
-	// 子命令后的 flag（如 sssingbox node add -protocol vless）由各子命令自己再解析，
-	// 这里只把 -data/-port 摘出来，其余原样留给子命令。
-	// 例外：node add 自带 -port（节点监听端口，0=自动分配），不能被当成面板端口摘走，
-	// 否则 sssingbox node add -port 0 会去连面板 0 端口。node add 的面板端口同样
-	// 走数据库解析（见 resolvePanelPort），不再固定 18081。
 	isNodeAdd := len(args) >= 2 && args[0] == "node" && args[1] == "add"
 	dataDir := "/var/lib/sssingbox"
+	if envDir := envCompat("SSSINGBOX_DATA", "SSSingBOX_DATA"); envDir != "" {
+		dataDir = envDir
+	}
 	port := 18081
 	portExplicit := false
+	if envPort := envCompat("SSSINGBOX_PORT", "SSSingBOX_PORT"); envPort != "" {
+		if p, err := strconv.Atoi(strings.TrimSpace(envPort)); err == nil && p > 0 && p < 65536 {
+			port = p
+			portExplicit = true
+		}
+	}
 	var rest []string
 	for i := 1; i < len(args); i++ {
 		if args[i] == "-data" && i+1 < len(args) {
@@ -259,19 +267,26 @@ func Run(args []string) int {
 		} else if strings.HasPrefix(args[i], "-data=") {
 			dataDir = strings.TrimPrefix(args[i], "-data=")
 		} else if args[i] == "-port" && i+1 < len(args) && !isNodeAdd {
-			port, _ = strconv.Atoi(args[i+1])
+			p, err := strconv.Atoi(args[i+1])
+			if err != nil || p < 1 || p > 65535 {
+				fmt.Println("错误：-port 必须是 1-65535 的数字")
+				return 2
+			}
+			port = p
 			portExplicit = true
 			i++
 		} else if strings.HasPrefix(args[i], "-port=") && !isNodeAdd {
-			port, _ = strconv.Atoi(strings.TrimPrefix(args[i], "-port="))
+			p, err := strconv.Atoi(strings.TrimPrefix(args[i], "-port="))
+			if err != nil || p < 1 || p > 65535 {
+				fmt.Println("错误：-port 必须是 1-65535 的数字")
+				return 2
+			}
+			port = p
 			portExplicit = true
 		} else {
 			rest = append(rest, args[i])
 		}
 	}
-	// 未显式传 -port 时，跟面板实际端口走：面板里改端口后数据库的 panel_port
-	// 与服务文件会同步更新，CLI 读库即可自动识别新端口，不再死磕 18081。
-	// 读不到（库不存在/无此键/非法值）时回落 18081，保持旧行为。
 	if !portExplicit {
 		port = resolvePanelPort(dataDir)
 	}
@@ -326,8 +341,12 @@ func runStatus(o options) int {
 			on++
 		}
 	}
-	fmt.Printf("面板版本：%v\n面板地址：http://%v:%v/\n节点：%d 个（启用 %d 个）\n",
-		st["version"], st["public_ip"], st["panel_port"], len(nodes), on)
+	host := fmt.Sprintf("%v", st["public_ip"])
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	fmt.Printf("面板版本：%v\n面板地址：http://%s:%v/%s\n节点：%d 个（启用 %d 个）\n",
+		st["version"], host, st["panel_port"], panelPathSuffix(st), len(nodes), on)
 	return 0
 }
 
@@ -404,7 +423,6 @@ func runAdminReset(o options) int {
 	defer st.Close()
 	user := prompt("要重置的账号（留空用第一个管理员）：")
 	if user == "" {
-		// 面板账号可能是随机生成的，不再默认 admin：取库里第一个账号。
 		users := st.ListUsers()
 		if len(users) == 0 {
 			fmt.Println("库里没有账号，先在面板里创建管理员")
@@ -426,8 +444,6 @@ func runAdminReset(o options) int {
 		fmt.Println("新密码至少 6 位")
 		return 1
 	}
-	// bcrypt 硬上限 72 字节：超了 GenerateFromPassword 报错，以前错误被吞了，
-	// 空哈希直接入库，账号就此锁死（面板三处同款 bug 已修，这里补上）。
 	if len(p1) > 72 {
 		fmt.Println("新密码不能超过 72 字节")
 		return 1
@@ -441,14 +457,11 @@ func runAdminReset(o options) int {
 		fmt.Println("密码更新失败：", err)
 		return 1
 	}
-	// CLI 凭证同步更新，否则下次 sssingbox 命令会用旧密码登录失败。
 	_ = saveCredentials(o.dataDir, credentials{Username: user, Password: p1})
 	fmt.Println("密码已重置，CLI 凭证已同步更新（面板里已登录的会话不受影响）")
 	return 0
 }
 
-// runCore：sssingbox core list | sssingbox core install <sing-box> [-version <tag>]。
-// 建节点要求内核先装好；纯 SSH 流程（不用面板）就靠它装内核，否则第一个节点永远建不出来。
 func runCore(o options, args []string) int {
 	if len(args) == 0 {
 		fmt.Println("用法：sssingbox core list | sssingbox core install <sing-box> [-version <tag>]（version 留空=最新版）")
@@ -492,17 +505,17 @@ func runCore(o options, args []string) int {
 			return 2
 		}
 		name := args[1]
-		version := ""
+		ver := ""
 		for i := 2; i < len(args); i++ {
 			if args[i] == "-version" && i+1 < len(args) {
-				version = args[i+1]
+				ver = args[i+1]
 				i++
 			} else if strings.HasPrefix(args[i], "-version=") {
-				version = strings.TrimPrefix(args[i], "-version=")
+				ver = strings.TrimPrefix(args[i], "-version=")
 			}
 		}
 		fmt.Printf("正在安装 %s 内核（版本留空=最新版）…\n", name)
-		data, err := c.call("POST", "/api/cores/"+name+"/install", map[string]interface{}{"version": version})
+		data, err := c.call("POST", "/api/cores/"+name+"/install", map[string]interface{}{"version": ver})
 		if err != nil {
 			fmt.Println("安装失败：", err)
 			return 1
@@ -555,7 +568,7 @@ func runNode(o options, args []string) int {
 		method := fs.String("method", "2022-blake3-aes-128-gcm", "SS 加密方式")
 		cert := fs.String("cert", "", "Naive 证书文件路径")
 		key := fs.String("key", "", "Naive 密钥文件路径")
-		version := fs.Int("version", 5, "Snell 版本（5 或 6，默认 5）")
+		ver := fs.Int("version", 5, "Snell 版本（5 或 6，默认 5）")
 		obfs := fs.String("obfs", "http", "Snell v5 混淆（http 或 none）")
 		handshake := fs.String("handshake", "", "ShadowTLS 握手站域名（留空默认 gateway.icloud.com）")
 		if err := fs.Parse(args[1:]); err != nil {
@@ -585,7 +598,7 @@ func runNode(o options, args []string) int {
 		case "ss":
 			adv = map[string]interface{}{"method": *method}
 		case "snell":
-			adv = map[string]interface{}{"version": *version, "obfs_mode": *obfs}
+			adv = map[string]interface{}{"version": *ver, "obfs_mode": *obfs}
 		case "shadowtls":
 			if *handshake != "" {
 				adv = map[string]interface{}{"handshake": *handshake}
@@ -680,22 +693,15 @@ func runNode(o options, args []string) int {
 }
 
 // loopbackTransport：只用于连本机 127.0.0.1 的面板 API。
-// 跳过证书校验是故意的：面板证书是给域名签的，永远匹配不上 127.0.0.1，
-// 校验开了反而连不上；流量只走本机回环，不经过网卡，中间人够不着。
-// 环境变量 SSSINGBOX_STRICT_TLS=1 可强制打开校验（会连不上，除非证书
-// 真的签给了 127.0.0.1）。名字里的 insecure 是旧名，已改成 loopback，
-// 免得后来人以为这是通用跳过校验。
+// 同时支持 SSSINGBOX_STRICT_TLS=1 与旧拼写 SSSingBOX_STRICT_TLS=1。
 func loopbackTransport() *http.Transport {
-	if os.Getenv("SSSingBOX_STRICT_TLS") == "1" {
+	if envCompat("SSSINGBOX_STRICT_TLS", "SSSingBOX_STRICT_TLS") == "1" {
 		return &http.Transport{}
 	}
 	return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 }
 
 func confirm(msg string) bool {
-	fmt.Printf("%s [y/N] ", msg)
-	var line string
-	fmt.Scanln(&line)
-	line = strings.ToLower(strings.TrimSpace(line))
+	line := strings.ToLower(prompt(msg + " [y/N] "))
 	return line == "y" || line == "yes"
 }

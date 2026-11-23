@@ -287,6 +287,10 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
 	}
+	// 二进制替换期间才持写锁：下载与冒烟已在锁外完成，此处只剩本地磁盘 IO，
+	// 期间其他接口（列表/查询）不再被 10 分钟的下载卡住。
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	oldData, err := os.ReadFile(exe)
 	if err != nil {
 		errJSON(w, 500, "读旧二进制失败："+err.Error())

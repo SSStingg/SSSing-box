@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"math/rand"
 	"net"
 	"strings"
@@ -100,12 +101,14 @@ func SNIBehindCloudflare(sni string) (bool, error) {
 	if ip := net.ParseIP(sni); ip != nil {
 		return IsCloudflareIP(ip), nil
 	}
-	ips, err := net.LookupIP(sni)
-	if err != nil || len(ips) == 0 {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, sni)
+	if err != nil || len(addrs) == 0 {
 		return false, err
 	}
-	for _, ip := range ips {
-		if IsCloudflareIP(ip) {
+	for _, a := range addrs {
+		if IsCloudflareIP(a.IP) {
 			return true, nil
 		}
 	}
@@ -125,10 +128,21 @@ func IsRealityMode(protocol, mode string) bool {
 	return false
 }
 func RecommendSNI(exclude string) SNICandidate {
-	rand.Seed(time.Now().UnixNano())
+	return RecommendSNIExcluding(exclude)
+}
+
+// RecommendSNIExcluding 从 SNIList 随机取一个，排除给定的若干域名。
+func RecommendSNIExcluding(excludes ...string) SNICandidate {
 	pool := make([]SNICandidate, 0, len(SNIList))
 	for _, c := range SNIList {
-		if c.Domain != exclude {
+		excluded := false
+		for _, ex := range excludes {
+			if c.Domain == ex {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
 			pool = append(pool, c)
 		}
 	}
@@ -136,4 +150,16 @@ func RecommendSNI(exclude string) SNICandidate {
 		return SNIList[0]
 	}
 	return pool[rand.Intn(len(pool))]
+}
+
+// RandomSnellObfsHost：Snell v5 http 混淆 Host 随机推荐——从 SNI 池里取，
+// bing.com / www.bing.com 永不入选（各家脚本用烂了的默认 Host，特征明显）。
+func RandomSnellObfsHost() string {
+	return RecommendSNIExcluding("bing.com", "www.bing.com").Domain
+}
+
+// RandomHandshakeHost：ShadowTLS 握手站随机推荐——排除默认站本身
+// （再抽到默认站就等于没随机）和 bing.com。
+func RandomHandshakeHost() string {
+	return RecommendSNIExcluding("gateway.icloud.com", "bing.com", "www.bing.com").Domain
 }

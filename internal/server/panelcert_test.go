@@ -360,7 +360,7 @@ func TestDualListener(t *testing.T) {
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})}
-	go srv.Serve(&dualListener{Listener: ln, tlsCfg: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}})
+	go srv.Serve(newDualListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}))
 	defer srv.Close()
 	addr := ln.Addr().String()
 	// 明文。

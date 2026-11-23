@@ -17,8 +17,6 @@ function toast(msg, isErr){
 async function api(path, method, body, timeoutMs){
   const opt = { method: method || 'GET', headers: {'Content-Type':'application/json'} };
   if (body !== undefined) opt.body = JSON.stringify(body);
-  // 普通请求默认 15 秒超时；下载/安装类长请求由调用处传更大的超时（0 = 不限），
-  // 超时后 abort，避免请求无限挂起。
   const ctl = new AbortController();
   const ms = timeoutMs === undefined ? 15000 : timeoutMs;
   const to = ms > 0 ? setTimeout(() => ctl.abort(), ms) : null;
@@ -59,9 +57,10 @@ function uuidv4(){
   return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
 }
 function escHtml(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escAttr(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function copyText(idOrVal, val){
   const text = val !== undefined ? val : $(idOrVal).value;
-  const done = ()=> toast('已复制');
+  const done = ()=> toast('已复制到剪贴板');
   if (navigator.clipboard && navigator.clipboard.writeText){
     navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(text, done));
   } else fallbackCopy(text, done);
@@ -77,8 +76,6 @@ function effAddr(n){
 }
 
 // ---------- modal ----------
-// MODAL_LOCKED：锁定时遮罩点击与 closeModal 都不关闭（法律声明弹窗用，
-// 必须点确认按钮才能进面板）。
 let MODAL_LOCKED = false;
 function openModal(html, wide){
   $('modalBox').innerHTML = html;
@@ -88,8 +85,8 @@ function openModal(html, wide){
 function closeModal(){ if (MODAL_LOCKED) return; $('overlay').className = 'overlay'; }
 $('overlay').addEventListener('click', e => { if (e.target.id === 'overlay' && !MODAL_LOCKED) closeModal(); });
 function confirmModal(title, bodyHtml, okText, onOk){
-  openModal(`<h4>${title}</h4><div style="color:var(--mut)">${bodyHtml}</div>
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn red" id="cfmOk">${okText}</button></div>
+  openModal(`<h4>${escHtml(title)}</h4><div style="color:var(--txt-secondary);line-height:1.7">${bodyHtml}</div>
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn red" id="cfmOk">${escHtml(okText)}</button></div>
     <div class="msg" id="cfmMsg"></div>`);
   $('cfmOk').onclick = async ()=>{
     $('cfmOk').disabled = true;
@@ -98,9 +95,6 @@ function confirmModal(title, bodyHtml, okText, onOk){
 }
 
 // ---------- 法律声明（首次登录弹窗） ----------
-// localStorage 记确认状态；确认过的不再弹，没确认过（包括已登录的老用户
-// 第一次打开面板）弹一次。弹窗锁死：没有关闭叉、点遮罩也不关，只有确认
-// 按钮能进面板。
 const DISCLAIMER_KEY = 'sssingbox_disclaimer_ack';
 function disclaimerAcked(){
   try { return !!localStorage.getItem(DISCLAIMER_KEY); } catch(e){ return false; }
@@ -108,8 +102,8 @@ function disclaimerAcked(){
 function showDisclaimer(){
   if (disclaimerAcked()) return;
   MODAL_LOCKED = true;
-  openModal(`<h4>使用须知</h4>
-    <div style="color:var(--mut);font-size:14px;line-height:1.8">
+  openModal(`<h4>合规与使用须知</h4>
+    <div style="color:var(--txt-secondary);font-size:14px;line-height:1.8">
     <p style="margin:0 0 10px">SSSing-box 是一个 sing-box 代理管理面板，仅供网络安全学习、研究与测试使用。</p>
     <p style="margin:0 0 10px">请勿将本项目用于绕过网络审查、规避检测、非法访问受限内容，或任何违反所在国家和地区法律法规的用途。</p>
     <p style="margin:0">本项目禁止中国大陆地区用户部署与使用。如您是中国大陆居民，请勿使用本项目，并立即停止访问。</p>
@@ -136,7 +130,6 @@ function hideAllAuth(){
   $('loginView').style.display = 'none';
   $('appView').style.display = 'none';
 }
-// 随机账号：首位字母，后 7 位字母数字（不含易混的 0/1/o/l），绝不默认 admin。
 function randomUsername(){
   const first = 'abcdefghjkmnpqrstuvwxyz', rest = first + '23456789';
   let s = first[Math.floor(Math.random() * first.length)];
@@ -148,6 +141,7 @@ function showSetup(){
   if ($('setupUser') && !$('setupUser').value) $('setupUser').value = randomUsername();
   $('setupView').style.display = 'flex';
   if (POLL){ clearInterval(POLL); POLL = null; }
+  if (PING_POLL){ clearInterval(PING_POLL); PING_POLL = null; }
 }
 function showLogin(){
   LOGIN_TMP = '';
@@ -155,6 +149,7 @@ function showLogin(){
   hideAllAuth();
   $('loginView').style.display = 'flex';
   if (POLL){ clearInterval(POLL); POLL = null; }
+  if (PING_POLL){ clearInterval(PING_POLL); PING_POLL = null; }
 }
 function showApp(){
   hideAllAuth();
@@ -171,7 +166,11 @@ async function doSetup(){
   const p = $('setupPass').value, p2 = $('setupPass2').value;
   if (p !== p2){ $('setupErr').textContent = '两次输入的密码不一致'; return; }
   try {
-    await api('/api/setup', 'POST', { username: u, password: p, password2: p2 });
+    const r = await api('/api/setup', 'POST', { username: u, password: p, password2: p2 });
+    if (r && r.panel_path && !window.PANEL_BASE){
+      location.href = '/' + r.panel_path + '/';
+      return;
+    }
     showApp();
   } catch(e){ $('setupErr').textContent = e.message; }
 }
@@ -208,8 +207,8 @@ function ringHTML(pct, cls){
   const off = C * (1 - Math.min(100, Math.max(0, pct)) / 100);
   const color = pct >= 90 ? 'bad' : pct >= 75 ? 'warn' : '';
   return `<svg width="76" height="76" viewBox="0 0 76 76">
-    <circle class="bg" cx="38" cy="38" r="32" fill="none" stroke-width="9"/>
-    <circle class="fg ${cls || color}" cx="38" cy="38" r="32" fill="none" stroke-width="9"
+    <circle class="bg" cx="38" cy="38" r="32" fill="none" stroke-width="8"/>
+    <circle class="fg ${cls || color}" cx="38" cy="38" r="32" fill="none" stroke-width="8"
       stroke-dasharray="${C}" stroke-dashoffset="${off}"/>
   </svg><div class="num">${fmtPct(pct)}</div>`;
 }
@@ -233,9 +232,6 @@ function renderSystem(d){
 }
 
 // ---------- cores ----------
-// 安装中的内核：名字 -> 当前阶段文案。状态页每 5 秒重绘内核卡片，
-// 以前重绘会把进行中的“下载中…”按钮整个换回“下载”，等于没反馈；
-// 现在重绘按这张表渲染，按钮状态在安装结束前不会被刷新抹掉。
 let CORE_LIST = [];
 const CORE_INSTALL = {};
 async function refreshCores(){
@@ -243,24 +239,25 @@ async function refreshCores(){
   CORE_LIST = list;
   const el = $('coreRows');
   if (!list.length){ el.innerHTML = '<div class="empty">暂无内核信息</div>'; return; }
-  el.innerHTML = list.map(c => `
+  el.innerHTML = list.map(c => {
+    const nm = escAttr(c.name), tt = escAttr(c.title);
+    return `
     <div class="row core-row">
       <span class="dot ${c.running ? 'on' : 'off'}"></span>
-      <div class="grow"><div class="t">${c.title}</div>
-        <div class="s">${c.installed ? ('已安装 ' + c.version + (c.has_update ? ' · 有新版本 ' + c.latest : '')) : '未下载，不占空间'}${c.note ? ' · ' + c.note : ''}${c.name === 'sing-box' ? ' · 通用代理内核' : ''}</div></div>
+      <div class="grow"><div class="t">${escHtml(c.title)}</div>
+        <div class="s">${c.installed ? ('已安装 ' + escHtml(c.version) + (c.has_update ? ' · 有新版本 ' + escHtml(c.latest) : '')) : '未下载，不占空间'}${c.note ? ' · ' + escHtml(c.note) : ''}${c.name === 'sing-box' ? ' · 通用代理内核' : ''}</div></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
         ${CORE_INSTALL[c.name]
-          ? `<button class="btn small" data-install-core="${c.name}" disabled>${CORE_INSTALL[c.name]}</button>`
+          ? `<button class="btn small" data-install-core="${nm}" disabled>${escHtml(CORE_INSTALL[c.name])}</button>`
           : (c.installed
-            ? `${c.no_update ? '' : `<button class="btn ghost small" onclick="openVerDialog('${c.name}','${c.title}')">更新</button>`}
-               <button class="btn ghost small" onclick="restartCore('${c.name}')">重启</button>
-               <button class="btn ghost small" onclick="showCoreLog('${c.name}','${c.title}')">日志</button>`
-            : `<button class="btn small" data-install-core="${c.name}" onclick="installCore('${c.name}','',this)">下载</button>`)}
+            ? `${c.no_update ? '' : `<button class="btn ghost small" data-core="${nm}" onclick="openVerDialog(this.dataset.core)">版本/更新</button>`}
+               <button class="btn ghost small" data-core="${nm}" onclick="restartCore(this.dataset.core)">重启</button>
+               <button class="btn ghost small" data-core="${nm}" onclick="showCoreLog(this.dataset.core)">日志</button>`
+            : `<button class="btn small" data-install-core="${nm}" data-core="${nm}" onclick="installCore(this.dataset.core,'',this)">下载安装</button>`)}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
-// 安装进度轮询：服务端在下载阶段报 downloading，解压写入阶段报 installing；
-// 前端按真实阶段改按钮文案，不用假计时。轮询只改按钮文案，不重绘整张卡。
 function pollCoreProgress(name, setText){
   let busy = false;
   return setInterval(async () => {
@@ -276,7 +273,7 @@ function pollCoreProgress(name, setText){
   }, 800);
 }
 function coreInstallBtn(name){
-  return document.querySelector('[data-install-core="' + name + '"]');
+  return document.querySelector('[data-install-core="' + CSS.escape(name) + '"]');
 }
 async function installCore(name, version, btn){
   if (CORE_INSTALL[name]) return;
@@ -284,43 +281,50 @@ async function installCore(name, version, btn){
   if (btn){ btn.disabled = true; btn.textContent = '下载中…'; }
   const timer = pollCoreProgress(name, t => { const b = coreInstallBtn(name) || btn; if (b) b.textContent = t; });
   try {
-    const r = await api('/api/cores/' + name + '/install', 'POST', { version: version || '' }, 600000);
+    const r = await api('/api/cores/' + encodeURIComponent(name) + '/install', 'POST', { version: version || '' }, 600000);
     toast(name + ' 已安装 ' + r.version);
   } catch(e){ toast(e.message, true); }
   clearInterval(timer);
   delete CORE_INSTALL[name];
   refreshCores(); refreshStatus();
 }
-async function openVerDialog(name, title){
+// coreTitle：按名字从内核列表取显示标题。onclick 只传名字，标题不在 HTML/JS 字符串里拼。
+function coreTitle(name){
+  const c = CORE_LIST.find(x => x.name === name);
+  return c ? c.title : name;
+}
+async function openVerDialog(name){
   VER_SHOW_ALL = false;
-  openModal(`<div class="ver-head"><h4>${title} · 选择版本安装</h4><button class="btn ghost sm" id="verAllBtn" onclick="toggleVerAll('${name}')">显示所有内核</button></div><div class="ver-list" id="verList"><div class="muted" style="padding:14px">正在获取版本…</div></div>
+  const nm = escAttr(name);
+  openModal(`<div class="ver-head"><h4>${escHtml(coreTitle(name))} · 选择版本安装</h4><button class="btn ghost sm" id="verAllBtn" data-core="${nm}" onclick="toggleVerAll(this.dataset.core)">显示所有内核</button></div><div class="ver-list" id="verList"><div class="muted" style="padding:14px">正在获取版本…</div></div>
     <div class="foot"><button class="btn ghost" onclick="closeModal()">关闭</button></div><div class="msg" id="verMsg"></div>`);
   loadVerList(name);
 }
 async function loadVerList(name){
   $('verList').innerHTML = '<div class="muted" style="padding:14px">正在获取版本…</div>';
   try {
-    const vers = await api('/api/cores/' + name + '/versions' + (VER_SHOW_ALL ? '?all=1' : ''));
+    const vers = await api('/api/cores/' + encodeURIComponent(name) + '/versions' + (VER_SHOW_ALL ? '?all=1' : ''));
     if (!vers.length){ $('verList').innerHTML = '<div class="muted" style="padding:14px">没有可用版本</div>'; return; }
+    const nm = escAttr(name);
     $('verList').innerHTML = vers.map(v =>
-      `<button onclick="installCoreVer('${name}','${v}',this)">${v}${isPreTag(v) ? ' <span class="tag-pre">测试版</span>' : ''}</button>`).join('');
+      `<button data-core="${nm}" data-ver="${escAttr(v)}" onclick="installCoreVer(this)">${escHtml(v)}${isPreTag(v) ? ' <span class="tag-pre">测试版</span>' : ''}</button>`).join('');
   } catch(e){ $('verMsg').className = 'msg err'; $('verMsg').textContent = e.message; }
 }
-// isPreTag：带 - 后缀的 tag（如 v1.15.0-alpha.13）是预发布版，前端打“测试版”标记。
-function isPreTag(v){ return v.indexOf('-') > 0; }
+function isPreTag(v){ return String(v).indexOf('-') > 0; }
 let VER_SHOW_ALL = false;
 function toggleVerAll(name){
   VER_SHOW_ALL = !VER_SHOW_ALL;
   $('verAllBtn').textContent = VER_SHOW_ALL ? '只显示正式版' : '显示所有内核';
   loadVerList(name);
 }
-async function installCoreVer(name, ver, btn){
+async function installCoreVer(btn){
+  const name = btn.dataset.core, ver = btn.dataset.ver;
   if (CORE_INSTALL[name]) return;
   CORE_INSTALL[name] = '下载中…';
   btn.disabled = true; btn.textContent = '下载中…';
   const timer = pollCoreProgress(name, t => { btn.textContent = t; });
   try {
-    const r = await api('/api/cores/' + name + '/install', 'POST', { version: ver }, 600000);
+    const r = await api('/api/cores/' + encodeURIComponent(name) + '/install', 'POST', { version: ver }, 600000);
     toast(name + ' 已安装 ' + r.version);
     closeModal(); refreshCores(); refreshStatus();
   } catch(e){
@@ -331,18 +335,19 @@ async function installCoreVer(name, ver, btn){
   delete CORE_INSTALL[name];
 }
 async function restartCore(name){
-  try { await api('/api/cores/' + name + '/restart', 'POST', {}); toast(name + ' 已重启'); refreshStatus(); }
+  try { await api('/api/cores/' + encodeURIComponent(name) + '/restart', 'POST', {}); toast(name + ' 已重启'); refreshStatus(); }
   catch(e){ toast(e.message, true); }
 }
-async function showCoreLog(name, title){
+async function showCoreLog(name){
   try {
-    const log = await api('/api/cores/' + name + '/log');
-    openModal(`<h4>${title} · 日志（最近 100 行）</h4><div class="muted" style="padding:4px 0 10px">日志文件在面板数据目录 cores/ 下；单个文件超 10MB 自动只留最新 2000 行，不会一直堆。</div><pre class="log">${escHtml(log || '(暂无日志)')}</pre>
-      <div class="foot"><button class="btn ghost" onclick="clearCoreLog('${name}','${title}')">清理日志</button><button class="btn ghost" onclick="closeModal()">关闭</button></div>`, true);
+    const log = await api('/api/cores/' + encodeURIComponent(name) + '/log');
+    const nm = escAttr(name);
+    openModal(`<h4>${escHtml(coreTitle(name))} · 运行日志（最近 100 行）</h4><div class="muted" style="padding:2px 0 12px">日志文件位于面板数据目录 cores/ 下；单文件超过 10MB 自动截取最新 2000 行。</div><pre class="log">${escHtml(log || '(暂无日志)')}</pre>
+      <div class="foot"><button class="btn ghost" data-core="${nm}" onclick="clearCoreLog(this.dataset.core)">清空日志</button><button class="btn ghost" onclick="closeModal()">关闭</button></div>`, true);
   } catch(e){ toast(e.message, true); }
 }
-async function clearCoreLog(name, title){
-  try { await api('/api/cores/' + name + '/clear-log', 'POST', {}); toast('日志已清理'); showCoreLog(name, title); }
+async function clearCoreLog(name){
+  try { await api('/api/cores/' + encodeURIComponent(name) + '/clear-log', 'POST', {}); toast('日志已清理'); showCoreLog(name); }
   catch(e){ toast(e.message, true); }
 }
 
@@ -376,9 +381,6 @@ function protoBadge(p){
   if (p === 'hysteria2') return '<span class="badge hy2">HY2</span>';
   return '<span class="badge">' + escHtml(p) + '</span>';
 }
-// 完整协议栈：徽章只写简称，第二行写全——
-// VLESS 是 sing-box 的 VLESS + Reality + TCP + 流控；
-// Hy2 是 QUIC/UDP + 真 TLS。
 function nodeCfg(id){
   const n = NODES.find(x => x.id === id);
   if (!n || !n.config) return null;
@@ -448,7 +450,7 @@ function renderUsage(u){
   const sc = $('trafficScroll');
   const keepScroll = sc ? sc.scrollTop : 0;
   if (!nodes.length){
-    el.innerHTML = '<div class="empty">还没有节点，去入站列表创建一个吧</div>';
+    el.innerHTML = '<div class="empty">还没有节点，去“节点与分流”创建一个吧</div>';
   } else {
     el.innerHTML = nodes.map(n => {
       rtUp += n.rate_up; rtDown += n.rate_down; tcp += n.tcp_conns;
@@ -456,14 +458,12 @@ function renderUsage(u){
       return `<div class="row">
         <span class="dot ${n.running ? 'on' : 'off'}"></span>
         <div class="grow"><div class="t">${escHtml(n.name)} ${protoBadge(n.protocol)}</div>
-          <div class="s">${escHtml(effAddr(n))}:${n.port} · ${n.enabled ? (n.running ? '运行中' : '核心未启动') : '已停用'}${quotaText(n)}</div>
+          <div class="s">${escHtml(effAddr(n))}:${n.port} · ${n.enabled ? (n.running ? '运行中' : '核心未启动') : '已停用'}${escHtml(quotaText(n))}</div>
           <div class="s2">${escHtml(protoFull(n.protocol, nodeCfg(n.id)))}</div></div>
         <div class="nums">今日 <b>${fmtBytes(n.today_up)} ↑ / ${fmtBytes(n.today_down)} ↓</b><br>本月 <b>${fmtBytes(n.month_up)} ↑ / ${fmtBytes(n.month_down)} ↓</b> · 总 <b>${fmtBytes(n.total_up + n.total_down)}</b></div>
       </div>`;
     }).join('');
   }
-  // 默认只看 3 条：列表超高时出滚动条 + 下箭头，点一下往下滚；
-  // 每 5 秒刷新会重绘列表，这里把滚动位置还回去，不打断查看。
   if (sc){
     sc.scrollTop = keepScroll;
     const more = $('trafficMore');
@@ -486,7 +486,7 @@ function renderLocalRows(){
   const el = $('localRows');
   if (!el) return;
   if (!NODES.length){
-    el.innerHTML = '<div class="empty">还没有节点，点左上角“添加入站”创建一个吧</div>';
+    el.innerHTML = '<div class="empty">还没有本地节点，点击左上角“＋ 新建代理入站”快速部署</div>';
     $('localSub').textContent = '';
     return;
   }
@@ -502,15 +502,16 @@ function renderLocalRows(){
       (n.protocol === 'vless' && cfg && (cfg.mode === 'ws' || cfg.mode === 'h2' || cfg.mode === 'httpupgrade')) ||
       (n.protocol === 'vmess' && cfg && cfg.mode && cfg.mode !== 'tcp') || n.protocol === 'naive';
     const sniWordShown = isDomainMode ? '域名' : sniWord(n.protocol);
-    const hideSni = n.protocol === 'ss' || n.protocol === 'socks' || n.protocol === 'http' || n.protocol === 'wireguard' || n.protocol === 'dokodemo' || (n.protocol === 'vmess' && (!cfg || !cfg.mode || cfg.mode === 'tcp'));
+    const hideSni = n.protocol === 'ss' || n.protocol === 'socks' || n.protocol === 'http' || n.protocol === 'wireguard' || n.protocol === 'dokodemo' || n.protocol === 'snell' || n.protocol === 'shadowtls' || (n.protocol === 'vmess' && (!cfg || !cfg.mode || cfg.mode === 'tcp'));
     const sniPart = hideSni ? '' : ` · ${sniWordShown} ${escHtml(n.sni)}`;
     const certHint = (n.protocol === 'naive' && cfg && !cfg.cert_file) ? ' · 缺 CA 证书，点 ⋮ 上传' : '';
+    const nid = escAttr(n.id);
     return `<div class="nrow">
-      <button class="menu-btn" title="设置" onclick="openNodeMenu(this,'${n.id}')">⋮</button>
-      <input type="checkbox" class="switch" ${n.enabled ? 'checked' : ''} title="${n.enabled ? '停用' : '启用'}" onchange="toggleNode('${n.id}', this.checked)">
+      <button class="menu-btn" title="操作菜单" onclick="openNodeMenu(this,'${nid}')">⋮</button>
+      <input type="checkbox" class="switch" ${n.enabled ? 'checked' : ''} title="${n.enabled ? '停用' : '启用'}" onchange="toggleNode('${nid}', this.checked)">
       <div style="min-width:0"><div class="t">${escHtml(n.name)}</div>
-        <div class="s">${escHtml(effAddr(n))}:${n.port}${sniPart} · ${n.enabled ? (u && u.running === false ? '核心未启动' : '运行中') : '已停用'}${uq}${certHint}</div>
-        <div class="s" style="color:var(--blue)">${escHtml(protoFull(n.protocol, cfg))}</div></div>
+        <div class="s">${escHtml(effAddr(n))}:${n.port}${sniPart} · ${n.enabled ? (u && u.running === false ? '核心未启动' : '运行中') : '已停用'}${escHtml(uq)}${certHint}</div>
+        <div class="s" style="color:var(--primary);font-weight:500">${escHtml(protoFull(n.protocol, cfg))}</div></div>
       <div class="cell"><b>${n.port}</b></div>
       <div class="cell">${protoBadge(n.protocol)}</div>
       <div class="cell hide-m"><b>${today}</b></div>
@@ -525,32 +526,31 @@ function showLink(id){
   const n = nodeById(id);
   if (!n) return;
   const link = n.link || '';
-  const extra = n.tme_link ? `<div style="margin-top:12px"><label>t.me 链接</label><div class="input-row"><input id="lkTme" readonly value="${escHtml(n.tme_link)}"><button class="btn ghost small" onclick="copyText('lkTme')">复制</button></div></div>` : '';
-  const linkField = (n.protocol === 'wireguard' || n.protocol === 'naive' || n.protocol === 'shadowtls')
-    ? `<label>${n.protocol === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : n.protocol === 'shadowtls' ? 'ShadowTLS 配置（sing-box 客户端 JSON，两个出站，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
-    : `<label>节点链接</label><div class="input-row"><input id="lkMain" readonly value="${escHtml(link)}"><button class="btn ghost small" onclick="copyText('lkMain')">复制</button></div>`;
-  const link6Field = !n.link6 ? '' : (n.protocol === 'wireguard'
-    ? `<div style="margin-top:12px"><label>WireGuard 配置 IPv6</label><textarea id="lkMain6" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(n.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain6')">复制配置</button></div></div>`
-    : `<div style="margin-top:12px"><label>节点链接 IPv6</label><div class="input-row"><input id="lkMain6" readonly value="${escHtml(n.link6)}"><button class="btn ghost small" onclick="copyText('lkMain6')">复制</button></div></div>`);
-  openModal(`<h4>${escHtml(n.name)} · 链接</h4>
+  const extra = n.tme_link ? `<div style="margin-top:12px"><label>t.me 链接</label><div class="input-row"><input id="lkTme" readonly value="${escAttr(n.tme_link)}"><button class="btn ghost small" onclick="copyText('lkTme')">复制</button></div></div>` : '';
+  const linkField = (n.protocol === 'wireguard' || n.protocol === 'naive')
+    ? `<label>${n.protocol === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%" class="mono">${escHtml(link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
+    : `<label>节点链接</label><div class="input-row"><input id="lkMain" readonly value="${escAttr(link)}"><button class="btn ghost small" onclick="copyText('lkMain')">复制</button></div>`;
+  const link6Field = !n.link6 ? '' : ((n.protocol === 'wireguard' || n.protocol === 'naive')
+    ? `<div style="margin-top:12px"><label>${n.protocol === 'wireguard' ? 'WireGuard 配置 IPv6' : 'Naive 配置 IPv6'}</label><textarea id="lkMain6" readonly rows="11" style="width:100%" class="mono">${escHtml(n.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain6')">复制配置</button></div></div>`
+    : `<div style="margin-top:12px"><label>节点链接 IPv6</label><div class="input-row"><input id="lkMain6" readonly value="${escAttr(n.link6)}"><button class="btn ghost small" onclick="copyText('lkMain6')">复制</button></div></div>`);
+  openModal(`<h4>${escHtml(n.name)} · 连接凭证与二维码</h4>
     ${linkField}
     ${link6Field}
     ${extra}
-    <div class="qr-box"><img src="${(window.PANEL_BASE||'')}/api/inbounds/${n.id}/qr" alt="二维码"></div>
+    <div class="qr-box"><img src="${escAttr((window.PANEL_BASE||'') + '/api/inbounds/' + encodeURIComponent(n.id) + '/qr')}" alt="二维码"></div>
     <div class="foot"><button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
 }
 function openNodeMenu(btn, id){
   const n = nodeById(id);
   if (!n) return;
+  const nid = escAttr(id);
   openDropdown(btn, `
-    <button onclick="closeDropdown();openEditNodeModal('${id}')">${MI.edit}编辑</button>
-    <button onclick="closeDropdown();showLink('${id}')">${MI.link}节点链接</button>
-    ${n.protocol === 'naive' ? `<button onclick="closeDropdown();openCertModal('${id}')">${MI.upload}上传 CA 证书</button>` : ''}
-    <button onclick="closeDropdown();resetNodeTraffic('${id}','${escHtml(n.name)}')">${MI.reset}重置流量</button>
-    <button class="danger" onclick="closeDropdown();delNode('${id}','${escHtml(n.name)}')">${MI.trash}删除节点</button>`);
+    <button onclick="closeDropdown();openEditNodeModal('${nid}')">${MI.edit}编辑配置</button>
+    <button onclick="closeDropdown();showLink('${nid}')">${MI.link}连接链接 / 二维码</button>
+    ${n.protocol === 'naive' ? `<button onclick="closeDropdown();openCertModal('${nid}')">${MI.upload}上传 CA 证书</button>` : ''}
+    <button onclick="closeDropdown();resetNodeTraffic('${nid}')">${MI.reset}重置统计流量</button>
+    <button class="danger" onclick="closeDropdown();delNode('${nid}')">${MI.trash}删除此节点</button>`);
 }
-// ⋮ 下拉菜单：贴在按钮右下角弹出；点空白处、滚动、按 Esc 就关；
-// 再点同一个按钮就收起来，点别的行的按钮就切过去。
 const MI = {
   edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
   link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
@@ -599,15 +599,15 @@ function openCertModal(id){
   if (!n) return;
   openModal(`<h4>${escHtml(n.name)} · 上传 CA 证书</h4>
     <div class="hint" style="margin:0 0 12px">Naive 必须用 CA 证书：证书上的域名要和节点域名一致，且解析到这台服务器。证书和私钥配对校验通过才保存，保存后立即重启生效。</div>
-    <div><label>证书（PEM）</label><textarea id="cfCert" rows="8" style="width:100%;font-family:monospace" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
-    <div style="margin-top:12px"><label>私钥（PEM）</label><textarea id="cfKey" rows="8" style="width:100%;font-family:monospace" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="certSaveBtn" onclick="uploadCert('${id}')">上传并启动</button></div>
+    <div><label>证书内容（PEM）</label><textarea id="cfCert" rows="7" style="width:100%" class="mono" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+    <div style="margin-top:12px"><label>私钥内容（PEM）</label><textarea id="cfKey" rows="7" style="width:100%" class="mono" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="certSaveBtn" onclick="uploadCert('${escAttr(id)}')">上传并启动</button></div>
     <div class="msg" id="certMsg"></div>`, true);
 }
 async function uploadCert(id){
   const btn = $('certSaveBtn'); btn.disabled = true;
   try {
-    await api('/api/inbounds/' + id + '/cert', 'POST', { cert: $('cfCert').value.trim(), key: $('cfKey').value.trim() });
+    await api('/api/inbounds/' + encodeURIComponent(id) + '/cert', 'POST', { cert: $('cfCert').value.trim(), key: $('cfKey').value.trim() });
     toast('证书已上传，节点已启动'); closeModal();
     await refreshStatus(); await loadChains();
   } catch(e){
@@ -623,8 +623,6 @@ function sniLabel(p, mode){
   if (p === 'vless') return (mode === 'ws' || mode === 'h2' || mode === 'httpupgrade') ? '域名（TLS 证书域名）' : '伪装域名（Reality SNI）';
   return '伪装域名（Reality SNI）';
 }
-// 节点列表里的域名叫法也要按协议分开，不能一律写“伪装”：
-// VLESS 的是 Reality 伪装域名，HY2 的是真 TLS 的 SNI（证书名）。
 function sniWord(p){
   if (p === 'hy2' || p === 'tuic' || p === 'anytls') return 'SNI';
   if (p === 'naive') return '域名';
@@ -642,8 +640,6 @@ function sniHintEdit(p, mode){
   if (p === 'trojan') return mode === 'cf' ? 'Trojan CF 档的域名在下方传输方式里改。' : (mode === 'h2' || mode === 'httpupgrade') ? 'Trojan TLS 档的域名就是链接里的地址，必须解析到这台服务器；面板按这个域名生成自签证书，客户端要允许不验证证书。改域名后证书要重建，旧链接失效。' : 'Trojan Reality 档改伪装域名时目标地址会跟着换，除非你之前手动改过它；CF 档的域名在下方传输方式里改。';
   return 'VLESS 改伪装域名时目标地址会跟着换，除非你之前手动改过它。';
 }
-// 编辑 = 添加的完整表单：基础项 + 高级参数（默认折叠）+ 流量设置（默认折叠），
-// 协议本身不能改——改协议等于换一个节点，去“添加入站”建新的。
 function openEditNodeModal(id){
   const n = nodeById(id);
   if (!n) return;
@@ -655,118 +651,116 @@ function openEditNodeModal(id){
   if (n.protocol === 'vless'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
       <div><label>传输方式</label><select id="eVlessMode"><option value="reality" ${(!cfg.mode || cfg.mode === 'reality') ? 'selected' : ''}>Reality + TCP</option><option value="ws" ${cfg.mode === 'ws' ? 'selected' : ''}>WS + TLS</option><option value="h2" ${cfg.mode === 'h2' ? 'selected' : ''}>H2 + TLS</option><option value="httpupgrade" ${cfg.mode === 'httpupgrade' ? 'selected' : ''}>HTTPUpgrade + TLS</option></select></div>
-      <div><label>路径（TLS 档）</label><input id="eVlessPath" value="${escHtml(cfg.path || '')}" placeholder="留空自动生成"></div>
-      <div><label>UUID</label><input id="eUuid" value="${escHtml(cfg.uuid || '')}" placeholder="留空保持原值"></div>
+      <div><label>路径（TLS 档）</label><input id="eVlessPath" value="${escAttr(cfg.path || '')}" placeholder="留空自动生成"></div>
+      <div><label>UUID</label><input id="eUuid" value="${escAttr(cfg.uuid || '')}" placeholder="留空保持原值"></div>
       <div><label>流控（Reality 档）</label><select id="eFlow"><option value="xtls-rprx-vision" ${cfg.flow === 'xtls-rprx-vision' ? 'selected' : ''}>xtls-rprx-vision</option><option value="" ${!cfg.flow ? 'selected' : ''}>无</option></select></div>
-      <div><label>目标地址（dest，Reality 档）</label><input id="eDest" value="${escHtml(cfg.dest || '')}" placeholder="留空保持原值"></div>
-      <div><label>ShortId（Reality 档）</label><input id="eShortId" value="${escHtml(cfg.short_id || '')}" placeholder="留空保持原值"></div>
+      <div><label>目标地址（dest，Reality 档）</label><input id="eDest" value="${escAttr(cfg.dest || '')}" placeholder="留空保持原值"></div>
+      <div><label>ShortId（Reality 档）</label><input id="eShortId" value="${escAttr(cfg.short_id || '')}" placeholder="留空保持原值"></div>
       <div><label>客户端指纹</label><select id="eFp">${['chrome','firefox','safari','random'].map(f => `<option value="${f}" ${cfg.fingerprint === f ? 'selected' : ''}>${f}</option>`).join('')}</select></div>
-      <div><label>SpiderX</label><input id="eSpiderX" value="${escHtml(cfg.spider_x || '/')}"></div>
-      <div><label>监听地址</label><input id="eListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>SpiderX</label><input id="eSpiderX" value="${escAttr(cfg.spider_x || '/')}"></div>
+      <div><label>监听地址</label><input id="eListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'hy2'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
       <div><label>密码</label><input id="eHPass" value="" placeholder="留空保持原值"></div>
       <div><label>混淆类型</label><select id="eHObfs"><option value="" ${!cfg.obfs_type ? 'selected' : ''}>无</option><option value="salamander" ${cfg.obfs_type === 'salamander' ? 'selected' : ''}>salamander</option></select></div>
       <div><label>混淆密码</label><input id="eHObfsPass" value="" placeholder="留空保持原值"></div>
-      <div><label>上行限速（Mbps，留空不限）</label><input id="eHUp" value="${escHtml(cfg.up_mbps || '')}"></div>
-      <div><label>下行限速（Mbps，留空不限）</label><input id="eHDown" value="${escHtml(cfg.down_mbps || '')}"></div>
-      <div><label>监听地址</label><input id="eHListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>上行限速（Mbps，留空不限）</label><input id="eHUp" value="${escAttr(cfg.up_mbps || '')}"></div>
+      <div><label>下行限速（Mbps，留空不限）</label><input id="eHDown" value="${escAttr(cfg.down_mbps || '')}"></div>
+      <div><label>监听地址</label><input id="eHListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
       <div><label><input type="checkbox" id="eHHop" ${cfg.hop_ports ? 'checked' : ''} onchange="document.getElementById('eHHopPorts').disabled=!this.checked"> 端口跳跃（默认关）</label></div>
-      <div><label>跳跃端口段</label><input id="eHHopPorts" value="${escHtml(cfg.hop_ports || '')}" placeholder="如 20000-40000" ${cfg.hop_ports ? '' : 'disabled'}></div>
+      <div><label>跳跃端口段</label><input id="eHHopPorts" value="${escAttr(cfg.hop_ports || '')}" placeholder="如 20000-40000" ${cfg.hop_ports ? '' : 'disabled'}></div>
       <div class="full muted">开启后内核把该 UDP 段的流量转发到本节点端口，客户端按段内跳端口连接；不开启的客户端仍走主端口。云厂商安全组里也要放行这段 UDP（面板改不了安全组）。</div>
     </div></details>`;
   } else if (n.protocol === 'vmess'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>UUID</label><input id="eVUuid" value="${escHtml(cfg.uuid || '')}" placeholder="留空保持原值"></div>
+      <div><label>UUID</label><input id="eVUuid" value="${escAttr(cfg.uuid || '')}" placeholder="留空保持原值"></div>
       <div><label>传输方式</label><select id="eVMode">${[['tcp','TCP 直连'],['cf','WS + Cloudflare'],['http','HTTP 明文'],['quic','QUIC + TLS'],['h2','H2 + TLS'],['httpupgrade','HTTPUpgrade + TLS']].map(([v, t]) => `<option value="${v}" ${(cfg.mode || 'tcp') === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
-      <div><label>域名（非 TCP 档）</label><input id="eVDomain" value="${escHtml(cfg.domain || n.sni || '')}" placeholder="CF/TLS 档必填，直连档就是 SNI"></div>
-      <div><label>路径（CF/HTTP/H2/HTTPUpgrade 档）</label><input id="eVPath" value="${escHtml(cfg.path || '')}" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eVListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>域名（非 TCP 档）</label><input id="eVDomain" value="${escAttr(cfg.domain || n.sni || '')}" placeholder="CF/TLS 档必填，直连档就是 SNI"></div>
+      <div><label>路径（CF/HTTP/H2/HTTPUpgrade 档）</label><input id="eVPath" value="${escAttr(cfg.path || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eVListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'ss'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
       <div><label>加密方法</label><select id="eSSMethod">${['2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm','aes-256-gcm','chacha20-ietf-poly1305'].map(m => `<option value="${m}" ${cfg.method === m ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
       <div><label>密码</label><input id="eSSPass" value="" placeholder="留空保持原值（换方法时留空自动生成对应密钥）"></div>
-      <div><label>监听地址</label><input id="eSListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eSListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'socks'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>用户名</label><input id="eSKUser" value="${escHtml(cfg.user || '')}" placeholder="留空保持原值"></div>
+      <div><label>用户名</label><input id="eSKUser" value="${escAttr(cfg.user || '')}" placeholder="留空保持原值"></div>
       <div><label>密码</label><input id="eSKPass" value="" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eSKListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eSKListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'http'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>用户名</label><input id="eHTUser" value="${escHtml(cfg.user || '')}" placeholder="留空保持原值"></div>
+      <div><label>用户名</label><input id="eHTUser" value="${escAttr(cfg.user || '')}" placeholder="留空保持原值"></div>
       <div><label>密码</label><input id="eHTPass" value="" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eHTListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eHTListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'trojan'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
       <div><label>密码</label><input id="eTPass" value="" placeholder="留空保持原值"></div>
       <div><label>传输方式</label><select id="eTMode">${[['reality','Reality 直连'],['cf','WS + Cloudflare'],['h2','H2 + TLS'],['httpupgrade','HTTPUpgrade + TLS']].map(([v, t]) => `<option value="${v}" ${(cfg.mode || 'reality') === v ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
-      <div><label>域名（CF/TLS 档）</label><input id="eTDomain" value="${escHtml(cfg.domain || n.sni || '')}" placeholder="CF/TLS 档必填"></div>
-      <div><label>路径（CF/TLS 档）</label><input id="eTPath" value="${escHtml(cfg.path || '')}" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eTListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>域名（CF/TLS 档）</label><input id="eTDomain" value="${escAttr(cfg.domain || n.sni || '')}" placeholder="CF/TLS 档必填"></div>
+      <div><label>路径（CF/TLS 档）</label><input id="eTPath" value="${escAttr(cfg.path || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eTListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'wireguard'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>客户端地址</label><input id="eWGIP" value="${escHtml(cfg.client_ip || '')}" placeholder="如 10.0.0.2/32，留空保持原值"></div>
-      <div><label>监听地址</label><input id="eWGListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>客户端地址</label><input id="eWGIP" value="${escAttr(cfg.client_ip || '')}" placeholder="如 10.0.0.2/32，留空保持原值"></div>
+      <div><label>监听地址</label><input id="eWGListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details><div class="hint">密钥建节点时已生成，编辑不换密钥；要换密钥就删了重建（克隆也会换全套密钥）。</div>`;
   } else if (n.protocol === 'tuic'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>UUID</label><input id="eTUuid" value="${escHtml(cfg.uuid || '')}" placeholder="留空保持原值"></div>
+      <div><label>UUID</label><input id="eTUuid" value="${escAttr(cfg.uuid || '')}" placeholder="留空保持原值"></div>
       <div><label>密码</label><input id="eTPw" value="" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eTListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eTListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'anytls'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>用户名</label><input id="eAName" value="${escHtml(cfg.name || '')}" placeholder="留空保持原值"></div>
+      <div><label>用户名</label><input id="eAName" value="${escAttr(cfg.name || '')}" placeholder="留空保持原值"></div>
       <div><label>密码</label><input id="eAPw" value="" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eAListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eAListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details>`;
   } else if (n.protocol === 'naive'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>用户名</label><input id="eNUser" value="${escHtml(cfg.username || '')}" placeholder="留空保持原值"></div>
+      <div><label>用户名</label><input id="eNUser" value="${escAttr(cfg.username || '')}" placeholder="留空保持原值"></div>
       <div><label>密码</label><input id="eNPw" value="" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eNListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eNListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details><div class="hint">证书在节点菜单“上传 CA 证书”里换；换域名后要重新上传对应证书。</div>`;
   } else if (n.protocol === 'snell'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
       <div><label>版本</label><select id="eSnVersion"><option value="5" ${(cfg.version || 5) === 5 ? 'selected' : ''}>v5（默认）</option><option value="6" ${cfg.version === 6 ? 'selected' : ''}>v6</option></select></div>
       <div><label>PSK</label><input id="eSnPsk" value="" placeholder="留空保持原值"></div>
       <div><label>混淆（v5）</label><select id="eSnObfs"><option value="http" ${(cfg.obfs_mode || 'http') === 'http' ? 'selected' : ''}>http</option><option value="none" ${cfg.obfs_mode === 'none' ? 'selected' : ''}>none</option></select></div>
-      <div><label>混淆 Host（v5）</label><input id="eSnObfsHost" value="${escHtml(cfg.obfs_host || '')}" placeholder="默认 bing.com"></div>
+      <div><label>混淆 Host（v5）</label><input id="eSnObfsHost" value="${escAttr(cfg.obfs_host || '')}" placeholder="留空随机推荐"></div>
       <div><label>流量整形（v6）</label><select id="eSnMode">${['default','unshaped','unsafe-raw'].map(m => `<option value="${m}" ${(cfg.mode || 'default') === m ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
-      <div><label>监听地址</label><input id="eSnListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eSnListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details><div class="hint">切到 v6 时 PSK 必须是 12-255 字节，太短会报错；v5 的混淆只在 v5 生效。</div>`;
   } else if (n.protocol === 'shadowtls'){
     adv = `<details class="adv"><summary>高级配置</summary><div class="form-grid">
-      <div><label>握手站域名</label><input id="eStHandshake" value="${escHtml(cfg.handshake || '')}" placeholder="默认 gateway.icloud.com"></div>
+      <div><label>握手站域名</label><div class="input-row"><input id="eStHandshake" value="${escAttr(cfg.handshake || '')}" placeholder="默认 gateway.icloud.com"><button class="btn ghost small" onclick="randomHandshake('eStHandshake')">随机</button></div></div>
       <div><label>密码</label><input id="eStPass" value="" placeholder="留空保持原值"></div>
-      <div><label>监听地址</label><input id="eStListen" value="${escHtml(cfg.listen || '')}" placeholder="留空保持原值"></div>
+      <div><label>监听地址</label><input id="eStListen" value="${escAttr(cfg.listen || '')}" placeholder="留空保持原值"></div>
     </div></details><div class="hint">内层 SS 的密码和回环端口由面板管理，编辑不改；strict 模式固定开启。</div>`;
   }
-  // Trojan 不进 noSni：Reality 档的 SNI 就用上面这行改，CF 档的域名
-  // 在下方传输方式里改（保存时 CF 档以域名为准，上面那行会被忽略）。
   const noSni = ['vmess', 'ss', 'socks', 'http', 'wireguard', 'dokodemo', 'snell', 'shadowtls'].includes(n.protocol);
   openModal(`<h4>编辑节点：${escHtml(n.name)}</h4>
-    <div class="hint" style="margin:0 0 12px">${escHtml(protoFull(n.protocol, cfg))}</div>
+    <div class="hint" style="margin:0 0 12px;color:var(--primary);font-weight:600">${escHtml(protoFull(n.protocol, cfg))}</div>
     <div class="form-grid">
-      <div><label>节点名</label><input id="eName" value="${escHtml(n.name)}"></div>
-      <div><label>节点IP</label><input id="eAddr" value="${escHtml(n.address)}"></div>
+      <div><label>节点名</label><input id="eName" value="${escAttr(n.name)}"></div>
+      <div><label>节点IP</label><input id="eAddr" value="${escAttr(n.address)}"></div>
       <div><label>端口</label><input id="ePort" type="number" value="${n.port}"></div>
-      ${noSni ? '' : `<div><label>${sniLabel(n.protocol, cfg.mode)}</label><input id="eSni" value="${escHtml(n.sni)}"></div>`}
+      ${noSni ? '' : `<div><label>${sniLabel(n.protocol, cfg.mode)}</label><input id="eSni" value="${escAttr(n.sni)}"></div>`}
     </div>
     <div class="hint">${sniHintEdit(n.protocol, cfg.mode)}</div>
     ${adv}
-    <details class="adv"><summary>流量设置</summary><div class="form-grid">
+    <details class="adv"><summary>流量限额设置</summary><div class="form-grid">
       <div><label>限额模式</label><select id="eQMode"><option value="" ${!n.quota_mode ? 'selected' : ''}>不限</option><option value="total" ${n.quota_mode === 'total' ? 'selected' : ''}>总流量（上下行合计）</option><option value="down" ${n.quota_mode === 'down' ? 'selected' : ''}>下行总流量（只计出口）</option></select></div>
-      <div><label>限额（G，面板的 GB）</label><input id="eQGB" type="number" step="any" value="${qGB}" placeholder="如 1000"></div>
+      <div><label>限额（G，面板的 GB）</label><input id="eQGB" type="number" step="any" value="${escAttr(qGB)}" placeholder="如 1000"></div>
     </div><div class="hint">服务器单项计算流量的，填“下行总流量”。达到限额前 1G 自动停用（填 1000G，到 999G 停），停了手动再开。</div></details>
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="editSaveBtn" onclick="saveEditNode('${id}')">保存</button></div>
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="editSaveBtn" onclick="saveEditNode('${escAttr(id)}')">保存修改</button></div>
     <div class="msg" id="editMsg"></div>`, true);
 }
 async function saveEditNode(id){
@@ -797,8 +791,8 @@ async function saveEditNode(id){
     if ($('eHPass').value.trim()) adv.password = $('eHPass').value.trim();
     adv.obfs_type = $('eHObfs').value;
     if ($('eHObfsPass').value.trim()) adv.obfs_password = $('eHObfsPass').value.trim();
-    if ($('eHUp').value.trim()) adv.up_mbps = $('eHUp').value.trim();
-    if ($('eHDown').value.trim()) adv.down_mbps = $('eHDown').value.trim();
+    adv.up_mbps = $('eHUp').value.trim();
+    adv.down_mbps = $('eHDown').value.trim();
     if ($('eHHop')) adv.hop_ports = $('eHHop').checked ? $('eHHopPorts').value.trim() : '';
     if ($('eHListen').value.trim()) adv.listen = $('eHListen').value.trim();
     body.advanced = adv;
@@ -878,44 +872,44 @@ async function saveEditNode(id){
   body.quota_mode = qMode;
   body.quota_bytes = qMode && !isNaN(qGB) && qGB > 0 ? Math.round(qGB * 1073741824) : 0;
   try {
-    await api('/api/inbounds/' + id, 'PUT', body);
-    toast('已保存'); closeModal();
+    await api('/api/inbounds/' + encodeURIComponent(id), 'PUT', body);
+    toast('节点配置已保存'); closeModal();
     await refreshStatus(); await loadChains();
   } catch(e){
     $('editMsg').className = 'msg err'; $('editMsg').textContent = e.message;
     btn.disabled = false;
   }
 }
-function resetNodeTraffic(id, name){
-  confirmModal('重置流量', `确定重置 <b>${name}</b> 的流量吗？累计流量和今日流量都会清零。`, '重置', async ()=>{
-    await api('/api/inbounds/' + id + '/reset-traffic', 'POST', {});
+function resetNodeTraffic(id){
+  const n = nodeById(id);
+  if (!n) return;
+  confirmModal('重置流量', `确定重置 <b>${escHtml(n.name)}</b> 的流量吗？累计流量和今日流量都会清零。`, '确认重置', async ()=>{
+    await api('/api/inbounds/' + encodeURIComponent(id) + '/reset-traffic', 'POST', {});
     toast('流量已重置'); refreshStatus();
   });
 }
 async function toggleNode(id, enable){
   try {
-    await api('/api/inbounds/' + id, 'PUT', { enabled: enable });
-    // 成功后必须重拉节点列表再渲染：以前只刷状态（system/usage），
-    // renderUsage 里 renderLocalRows() 读的还是旧 NODES，5 秒轮询一到
-    // 开关就被旧状态翻回去，直到整页刷新才显示正确状态。
+    await api('/api/inbounds/' + encodeURIComponent(id), 'PUT', { enabled: enable });
     const list = await api('/api/inbounds');
     NODES = Array.isArray(list) ? list : [];
     renderLocalRows();
     refreshStatus();
   }
-  // 开关失败时必须重载节点列表回滚视觉：以前只刷状态不刷 NODES，
-  // 开关保持翻转后的错误状态，直到切视图才恢复。
   catch(e){ toast(e.message, true); try { const list = await api('/api/inbounds'); NODES = Array.isArray(list) ? list : []; } catch(_){} renderLocalRows(); }
 }
-function delNode(id, name){
-  confirmModal('删除节点', `确定删除 <b>${name}</b> 吗？配置和累计用量会一起删掉。`, '删除', async ()=>{
-    await api('/api/inbounds/' + id, 'DELETE');
-    toast('已删除'); refreshStatus(); loadChains();
+function delNode(id){
+  const n = nodeById(id);
+  if (!n) return;
+  confirmModal('删除节点', `确定删除 <b>${escHtml(n.name)}</b> 吗？配置、累计用量以及绑定它的链式分流规则都会一起删掉。`, '确认删除', async ()=>{
+    await api('/api/inbounds/' + encodeURIComponent(id), 'DELETE');
+    toast('节点已删除'); refreshStatus(); loadChains();
   });
 }
+
 // ---------- add inbound (popup) ----------
 function addFormHTML(){
-  return `<h4>添加入站</h4>
+  return `<h4>新建代理入站</h4>
     <div class="tabs" id="protoTabs">
       <button data-proto="vless" class="on" onclick="setProto('vless')">VLESS<span class="tab-star">★</span></button>
       <button data-proto="hy2" onclick="setProto('hy2')">Hysteria2<span class="tab-star">★</span></button>
@@ -931,10 +925,10 @@ function addFormHTML(){
       <button data-proto="http" onclick="setProto('http')">HTTP</button>
       <button data-proto="wireguard" onclick="setProto('wireguard')">WireGuard</button>
     </div>
-    <div class="hint" id="protoStack" style="margin:0 0 14px">默认 · VLESS + Reality + TCP + xtls-rprx-vision</div>
+    <div class="hint" id="protoStack" style="margin:0 0 14px;color:var(--primary);font-weight:600">默认 · VLESS + Reality + TCP + xtls-rprx-vision</div>
     <div class="form-grid">
       <div>
-        <label>端口</label>
+        <label>监听端口</label>
         <div class="input-row">
           <input id="fPort" type="number" placeholder="留空自动建议" oninput="checkPort443Warning()">
           <button class="btn ghost small" onclick="fillSuggestPort()">自动建议</button>
@@ -950,11 +944,11 @@ function addFormHTML(){
         <div class="hint" id="sniHint">默认从精选清单里推荐，点“换一个”随机换。</div>
       </div>
       <div>
-        <label>节点名</label>
+        <label>节点备注名</label>
         <input id="fName" placeholder="留空自动生成，如 VLESS-8443">
       </div>
       <div>
-        <label>节点IP</label>
+        <label>节点连接 IP</label>
         <input id="fAddr" placeholder="留空自动取公网 IP">
       </div>
     </div>
@@ -1047,7 +1041,7 @@ function addFormHTML(){
           <option value="http">http（默认，伪装成普通 HTTP）</option>
           <option value="none">none（不混淆）</option>
         </select></div>
-        <div id="snObfsHostRow"><label>混淆 Host</label><input id="snObfsHost" placeholder="默认 bing.com"></div>
+        <div id="snObfsHostRow"><label>混淆 Host</label><input id="snObfsHost" placeholder="留空随机推荐"></div>
         <div id="snModeRow" style="display:none"><label>流量整形（v6）</label><select id="snMode">
           <option value="default">default（加密 + 整形，默认）</option>
           <option value="unshaped">unshaped（只加密，不整形）</option>
@@ -1058,10 +1052,10 @@ function addFormHTML(){
     </div>
     <div id="shadowtlsOpts" style="display:none">
       <div class="form-grid" style="margin-top:12px">
-        <div><label>握手站域名</label><input id="stHandshake" placeholder="默认 gateway.icloud.com"></div>
+        <div><label>握手站域名</label><div class="input-row"><input id="stHandshake" placeholder="默认 gateway.icloud.com"><button class="btn ghost small" onclick="randomHandshake('stHandshake')">随机</button></div></div>
         <div><label>密码</label><input id="stPass" placeholder="留空自动生成"></div>
       </div>
-      <div class="hint">ShadowTLS v3 + 内层 SS2022：握手直接转发给握手站（真证书、真页面，主动探测看到的是真站），strict 模式强制开；内层 SS 的密码和回环端口由面板自动配好，不对外暴露。交付的是 sing-box 客户端 JSON 配置（两个出站），不是 URL——ShadowTLS 没有标准分享链接格式。</div>
+      <div class="hint">ShadowTLS v3 + 内层 SS2022：握手直接转发给握手站（真证书、真页面，主动探测看到的是真站），strict 模式强制开；内层 SS 的密码和回环端口由面板自动配好，不对外暴露。分享链接为面板自定 shadowtls:// 格式（可直接粘贴到另一台面板做 B 节点）；通用客户端请使用 Sing-box JSON 或 Clash YAML 订阅。</div>
     </div>
     <div id="wgOpts" style="display:none">
       <div class="hint" style="margin-top:12px">WireGuard 走 UDP：面板给每个节点生成两对密钥（服务端一对、客户端一对），客户端公钥直接写进服务端，建好就能用。创建成功后在节点行“链接”里复制完整配置，贴进官方 WireGuard 客户端（或扫二维码）。</div>
@@ -1094,7 +1088,7 @@ function addFormHTML(){
       </div>
     </details>
 
-    <details class="adv"><summary>流量设置</summary><div class="form-grid">
+    <details class="adv"><summary>流量限额设置</summary><div class="form-grid">
       <div><label>限额模式</label><select id="qMode"><option value="">不限</option><option value="total">总流量（上下行合计）</option><option value="down">下行总流量（只计出口）</option></select></div>
       <div><label>限额（G，面板的 GB）</label><input id="qGB" type="number" step="any" placeholder="如 1000"></div>
     </div><div class="hint">服务器单项计算流量的，填“下行总流量”。达到限额前 1G 自动停用（填 1000G，到 999G 停），停了手动再开。</div></details>
@@ -1112,9 +1106,6 @@ function setProto(p){
   document.querySelectorAll('#protoTabs button').forEach(b => b.classList.toggle('on', b.dataset.proto === p));
   $('advVless').style.display = p === 'vless' ? '' : 'none';
   $('advHy2').style.display = p === 'hy2' ? '' : 'none';
-  // SNI 行只留给需要域名的协议：VLESS（Reality 伪装或 TLS 域名）、Hy2/TUIC/AnyTLS
-  // （SNI）、Naive（真实域名）；SS/SOCKS/HTTP/WireGuard 没有域名概念；
-  // VMess/Trojan 的域名只在非 TCP/非 Reality 档里才有意义，单独放在各自的 opts 里。
   const vlessMode = p === 'vless' ? $('vlMode').value : '';
   const trojanMode = p === 'trojan' ? $('tMode').value : '';
   const trojanDomain = p === 'trojan' && trojanMode !== 'reality';
@@ -1181,7 +1172,6 @@ function setProto(p){
   fillSuggestPort(true);
   checkPort443Warning();
 }
-// HY2/TUIC 用 443 时红字提醒：UDP 443 可能被运营商拦截。只提醒，不禁止。
 function checkPort443Warning(){
   const h = $('portHint');
   if (!h) return;
@@ -1198,7 +1188,7 @@ function checkPort443Warning(){
 }
 async function fillSuggestPort(quiet){
   try {
-    let q = '/api/suggest-port?protocol=' + CUR_PROTO;
+    let q = '/api/suggest-port?protocol=' + encodeURIComponent(CUR_PROTO);
     if (CUR_PROTO === 'vmess' && $('vMode') && $('vMode').value === 'cf') q += '&mode=cf';
     if (CUR_PROTO === 'trojan' && $('tMode') && $('tMode').value === 'cf') q += '&mode=cf';
     const r = await api(q);
@@ -1217,17 +1207,21 @@ async function randomSni(){
     $('sniHint').textContent = r.domain + '（' + r.label + '）';
   } catch(e){ toast(e.message, true); }
 }
+async function randomHandshake(id){
+  try {
+    const r = await api('/api/sni-random?exclude=gateway.icloud.com&exclude=bing.com');
+    if (r && r.domain) document.getElementById(id).value = r.domain;
+  } catch(e){ toast(e.message, true); }
+}
 async function createInbound(){
   const btn = $('btnCreate');
   btn.disabled = true; btn.textContent = '创建中…';
   $('createMsg').textContent = '';
-  // 前端先拦一道：需要的内核没装，根本不发创建请求；
-  // 后端还会再拦一道，没装核的节点一个都建不出来。
   const needCore = { vless: 'sing-box', vmess: 'sing-box', ss: 'sing-box', socks: 'sing-box', http: 'sing-box', trojan: 'sing-box', wireguard: 'sing-box', hy2: 'sing-box', tuic: 'sing-box', anytls: 'sing-box', naive: 'sing-box', snell: 'sing-box', shadowtls: 'sing-box' }[CUR_PROTO];
   const coreRow = CORE_LIST.find(c => c.name === needCore);
   if (coreRow && !coreRow.installed){
     $('createMsg').className = 'msg err';
-    $('createMsg').textContent = needCore + ' 内核还没安装：先去“系统状态”页的内核卡片安装 ' + needCore + '，装好再创建节点';
+    $('createMsg').textContent = needCore + ' 内核还没安装：先去“系统概览”页的内核卡片安装 ' + needCore + '，装好再创建节点';
     btn.disabled = false; btn.textContent = '创建节点';
     return;
   }
@@ -1313,26 +1307,25 @@ async function createInbound(){
   try {
     const r = await api('/api/inbounds', 'POST', body);
     closeModal();
-    // WireGuard 没有 URL 链接、Naive 与 ShadowTLS 交付的是 JSON 配置，都用多行框展示。
-    const linkField = (CUR_PROTO === 'wireguard' || CUR_PROTO === 'naive' || CUR_PROTO === 'shadowtls')
-      ? `<label>${CUR_PROTO === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : CUR_PROTO === 'shadowtls' ? 'ShadowTLS 配置（sing-box 客户端 JSON，两个出站，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(r.link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
-      : `<label>节点链接</label><div class="input-row"><input id="lkMain" readonly value="${escHtml(r.link)}"><button class="btn ghost small" onclick="copyText('lkMain')">复制</button></div>`;
-    const link6Field = !r.link6 ? '' : (CUR_PROTO === 'wireguard' || CUR_PROTO === 'shadowtls'
-      ? `<div style="margin-top:12px"><label>${CUR_PROTO === 'shadowtls' ? 'ShadowTLS 配置 IPv6' : 'WireGuard 配置 IPv6'}</label><textarea id="lkMain6" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(r.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain6')">复制配置</button></div></div>`
-      : `<div style="margin-top:12px"><label>节点链接 IPv6</label><div class="input-row"><input id="lkMain6" readonly value="${escHtml(r.link6)}"><button class="btn ghost small" onclick="copyText('lkMain6')">复制</button></div></div>`);
+    const linkField = (CUR_PROTO === 'wireguard' || CUR_PROTO === 'naive')
+      ? `<label>${CUR_PROTO === 'naive' ? 'Naive 配置（参考客户端 JSON 配置，不是 URL，别贴进 URL 导入框）' : 'WireGuard 配置（贴进官方客户端，或扫下方二维码）'}</label><textarea id="lkMain" readonly rows="11" style="width:100%" class="mono">${escHtml(r.link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain')">复制配置</button></div>`
+      : `<label>节点链接</label><div class="input-row"><input id="lkMain" readonly value="${escAttr(r.link)}"><button class="btn ghost small" onclick="copyText('lkMain')">复制</button></div>`;
+    const link6Field = !r.link6 ? '' : (CUR_PROTO === 'wireguard' || CUR_PROTO === 'naive'
+      ? `<div style="margin-top:12px"><label>${CUR_PROTO === 'wireguard' ? 'WireGuard 配置 IPv6' : 'Naive 配置 IPv6'}</label><textarea id="lkMain6" readonly rows="11" style="width:100%" class="mono">${escHtml(r.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkMain6')">复制配置</button></div></div>`
+      : `<div style="margin-top:12px"><label>节点链接 IPv6</label><div class="input-row"><input id="lkMain6" readonly value="${escAttr(r.link6)}"><button class="btn ghost small" onclick="copyText('lkMain6')">复制</button></div></div>`);
     openModal(`<h4>节点已创建：${escHtml(r.inbound.name)}</h4>
       ${linkField}
       ${link6Field}
-      ${r.tme_link ? `<div style="margin-top:12px"><label>t.me 链接</label><div class="input-row"><input id="lkTme" readonly value="${escHtml(r.tme_link)}"><button class="btn ghost small" onclick="copyText('lkTme')">复制</button></div></div>` : ''}
-      ${CUR_PROTO === 'naive' ? `<div class="hint" style="margin-top:12px">Naive 节点还没证书、暂时启动不了：去入站列表点节点行的 ⋮ → “上传 CA 证书”，上传后立即启动。</div>` : ''}
-      <div class="qr-box"><img src="${(window.PANEL_BASE||'')}/api/inbounds/${r.inbound.id}/qr" alt="二维码"></div>
-      <div class="foot"><button class="btn" onclick="closeModal()">知道了</button></div>`);
+      ${r.tme_link ? `<div style="margin-top:12px"><label>t.me 链接</label><div class="input-row"><input id="lkTme" readonly value="${escAttr(r.tme_link)}"><button class="btn ghost small" onclick="copyText('lkTme')">复制</button></div></div>` : ''}
+      ${CUR_PROTO === 'naive' ? `<div class="hint" style="margin-top:12px">Naive 节点还没证书、暂时启动不了：去节点列表点节点行的 ⋮ → “上传 CA 证书”，上传后立即启动。</div>` : ''}
+      <div class="qr-box"><img src="${escAttr((window.PANEL_BASE||'') + '/api/inbounds/' + encodeURIComponent(r.inbound.id) + '/qr')}" alt="二维码"></div>
+      <div class="foot"><button class="btn" onclick="closeModal()">完成</button></div>`);
     await refreshStatus(); await loadChains();
   } catch(e){ $('createMsg').className = 'msg err'; $('createMsg').textContent = '创建失败：' + e.message; }
   btn.disabled = false; btn.textContent = '创建节点';
 }
 
-// ---------- chains & bnodes ----------
+// ---------- chains & bnodes (多协议入口 A + 多 B 节点分流) ----------
 async function loadChains(){
   try { const c = await api('/api/chains'); CHAINS = Array.isArray(c) ? c : []; } catch(e){ CHAINS = []; }
   try { const b = await api('/api/bnodes'); BNODES = Array.isArray(b) ? b : []; } catch(e){ BNODES = []; }
@@ -1344,29 +1337,31 @@ async function loadChains(){
 function renderBNodeRows(){
   const el = $('bnodeRows');
   if (!el) return;
-  if (!BNODES.length){ el.innerHTML = '<div class="empty">还没有其他节点，点右上角“添加其他节点”，粘贴别的服务器的节点链接进来</div>'; return; }
-  el.innerHTML = BNODES.map(b => `
+  if (!BNODES.length){ el.innerHTML = '<div class="empty">还没有外部节点，点击右上角“＋ 导入外部节点”粘贴其他服务器的节点链接</div>'; return; }
+  el.innerHTML = BNODES.map(b => {
+    const bid = escAttr(b.id);
+    return `
     <div class="row">
-      <button class="menu-btn" title="设置" onclick="openBNodeMenu(this,'${b.id}')">⋮</button>
+      <button class="menu-btn" title="操作" onclick="openBNodeMenu(this,'${bid}')">⋮</button>
       <div class="grow"><div class="t">${escHtml(b.name)} ${protoBadge(b.protocol)}</div>
         <div class="s mono">${escHtml(b.link.slice(0, 90))}${b.link.length > 90 ? '…' : ''}</div></div>
-      <span class="ping" id="bping-${b.id}" title="本机到该节点服务器的延迟">测活中…</span>
-    </div>`).join('');
+      <span class="ping" id="bping-${bid}" title="本机到该节点服务器的延迟">测活中…</span>
+    </div>`;
+  }).join('');
   refreshBNodePing();
 }
 function openBNodeMenu(btn, id){
   const b = BNODES.find(x => x.id === id);
   if (!b) return;
+  const bid = escAttr(id);
   openDropdown(btn, `
-    <button onclick="closeDropdown();copyBNodeLink('${id}')">${MI.copy}复制链接</button>
-    <button class="danger" onclick="closeDropdown();delBNode('${id}','${escHtml(b.name)}')">${MI.trash}删除</button>`);
+    <button onclick="closeDropdown();copyBNodeLink('${bid}')">${MI.copy}复制原始链接</button>
+    <button class="danger" onclick="closeDropdown();delBNode('${bid}')">${MI.trash}删除外部节点</button>`);
 }
 function copyBNodeLink(id){
   const b = BNODES.find(x => x.id === id);
   if (b) copyText(null, b.link);
 }
-// 其他节点测活：本机 → B 节点服务器的 TCP 建连延迟，
-// 入站列表页每 3 秒刷新一次，只改 ping 数字，不重绘列表。
 async function refreshBNodePing(){
   if (!$('view-inbounds') || !$('view-inbounds').classList.contains('on')) return;
   if (!BNODES.length) return;
@@ -1376,37 +1371,37 @@ async function refreshBNodePing(){
       const el = $('bping-' + r.id);
       if (!el) return;
       if (r.kind === 'udp') el.textContent = 'UDP 协议不适用';
-      else if (r.ms >= 0) el.textContent = r.ms + 'ms';
+      else if (r.ms >= 0) el.textContent = r.ms + ' ms';
       else el.textContent = '不通';
     });
   } catch(e){}
 }
-function delBNode(id, name){
-  const used = CHAINS.filter(c => c.bnode_id === id);
-  const warn = used.length ? `它正被 ${used.length} 条链式规则用着，删了那条链式会一起失效（链式本身不会自动删，B 节点没了会启动失败）。` : '';
-  confirmModal('删除其他节点', `确定删除 <b>${name}</b> 吗？${warn}`, '删除', async ()=>{
-    await api('/api/bnodes/' + id, 'DELETE');
+function delBNode(id){
+  const b = BNODES.find(x => x.id === id);
+  if (!b) return;
+  const used = CHAINS.filter(c => c.bnode_id === id || (c.routes || []).some(r => r.bnode_id === id));
+  const warn = used.length ? `它正被 ${used.length} 条链式/分流规则引用，删除后对应分流组或链式规则将自动清理。` : '';
+  confirmModal('删除外部节点', `确定删除 <b>${escHtml(b.name)}</b> 吗？${warn}`, '确认删除', async ()=>{
+    await api('/api/bnodes/' + encodeURIComponent(id), 'DELETE');
     toast('已删除'); loadChains();
   });
 }
 function openAddBNodeModal(){
-  openModal(`<h4>添加其他节点</h4>
-    <label>粘贴节点链接（自动识别协议）</label>
-    <input id="bLink" placeholder="vless://、vmess://、trojan://、ss://、socks://、http://、hysteria2://">
-    <div class="hint">B 节点只支持这 7 种：VLESS、VMess、Trojan、SS、SOCKS、HTTP、Hysteria2。其他协议的链接保存时会被直接拒绝，不会混进来。</div>
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="bSaveBtn" onclick="saveBNodeFromModal()">保存</button></div>
+  openModal(`<h4>导入外部落地节点 (B 节点)</h4>
+    <label>粘贴节点分享链接（自动识别协议）</label>
+    <input id="bLink" placeholder="vless://、vmess://、trojan://、ss://、socks://、http://、hysteria2://、snell://、shadowtls://">
+    <div class="hint">B 节点支持 9 种协议：VLESS、VMess、Trojan、SS、SOCKS、HTTP、Hysteria2、Snell、ShadowTLS。</div>
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="bSaveBtn" onclick="saveBNodeFromModal()">解析并保存</button></div>
     <div class="msg" id="bMsg"></div>`);
 }
 async function saveBNodeFromModal(){
   const link = $('bLink').value.trim();
   if (!link){ $('bMsg').className = 'msg err'; $('bMsg').textContent = '请先粘贴节点链接'; return; }
-  // 前端先拦一道：协议不在 B 节点范围内的，根本不发请求；
-  // 后端 ParseBLink 还会再拦一道，两道都过不去才进得来。
   const scheme = link.split('://')[0].toLowerCase();
-  const okSchemes = ['vless', 'vmess', 'trojan', 'ss', 'socks', 'socks5', 'http', 'https', 'hysteria2', 'hy2'];
+  const okSchemes = ['vless', 'vmess', 'trojan', 'ss', 'socks', 'socks5', 'http', 'https', 'hysteria2', 'hy2', 'snell', 'shadowtls'];
   if (!okSchemes.includes(scheme)){
     $('bMsg').className = 'msg err';
-    $('bMsg').textContent = '不支持的协议：' + scheme + '（B 节点只支持 VLESS/VMess/Trojan/SS/SOCKS/HTTP/Hysteria2）';
+    $('bMsg').textContent = '不支持的协议：' + scheme + '（B 节点只支持 VLESS/VMess/Trojan/SS/SOCKS/HTTP/Hysteria2/Snell/ShadowTLS）';
     return;
   }
   const btn = $('bSaveBtn'); btn.disabled = true;
@@ -1419,80 +1414,192 @@ async function saveBNodeFromModal(){
     btn.disabled = false;
   }
 }
-function vlessOptions(selectedId, excludeChainId){
-  // A 节点下拉：把所有本地节点都列出来，选不了的灰掉并写明原因，
-  // 不再只列 VLESS——否则像甲骨文这样只剩 HY2 可选时，
-  // 下拉里一片空白，用户根本不知道为什么不能设。
-  if (!NODES.length) return '<option value="">（暂无本地节点，先去添加入站）</option>';
+
+// 入口 A 节点下拉选项：支持除 WireGuard / dokodemo 外全部本机节点，已绑定的自动置灰防冲突
+function chainAOptions(selectedId, excludeChainId){
+  if (!NODES.length) return '<option value="">（暂无本地节点，请先新建入站）</option>';
   return NODES.map(n => {
     let dis = '', note = '';
-    if (n.protocol !== 'vless'){
+    if (n.protocol === 'wireguard' || n.protocol === 'dokodemo'){
       dis = ' disabled';
-      note = '（只有 VLESS 能做 A 节点）';
+      note = '（' + n.protocol.toUpperCase() + ' 不支持做入口 A）';
     } else {
       const usedBy = CHAINS.find(c => c.inbound_id === n.id && c.id !== excludeChainId);
       if (usedBy){ dis = ' disabled'; note = '（已有链式）'; }
     }
     const sel = n.id === selectedId ? ' selected' : '';
-    return `<option value="${n.id}"${sel}${dis}>${escHtml(n.name)} :${n.port}${note}</option>`;
+    return `<option value="${escAttr(n.id)}"${sel}${dis}>[${escHtml(n.protocol.toUpperCase())}] ${escHtml(n.name)} :${n.port}${note}</option>`;
   }).join('');
 }
-function bnodeOptions(selectedId){
-  if (!BNODES.length) return '<option value="">（暂无其他节点，先添加其他节点）</option>';
-  return BNODES.map(b => `<option value="${b.id}"${b.id === selectedId ? ' selected' : ''}>${escHtml(b.name)}（${b.protocol}）</option>`).join('');
+
+function bnodeOptions(selectedId, includeDirect){
+  let html = includeDirect ? `<option value=""${!selectedId ? ' selected' : ''}>本机直连（默认）</option>` : '';
+  if (!BNODES.length && !includeDirect) return '<option value="">（暂无外部节点，请先导入外部节点）</option>';
+  html += BNODES.map(b => `<option value="${escAttr(b.id)}"${b.id === selectedId ? ' selected' : ''}>${escHtml(b.name)}（${escHtml(b.protocol)}）</option>`).join('');
+  return html;
 }
+
+function renderSplitGroupHTML(bnodeId, listText){
+  return `<div class="split-group" style="border:1px solid var(--line-subtle);border-radius:var(--r-md);padding:12px;margin-bottom:10px;background:rgba(248,250,252,.72)">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <span class="sg-idx badge" style="flex:none">分流</span>
+      <select class="sg-bnode" onchange="syncSplitSelects()" style="flex:1">${bnodeOptions(bnodeId || '', false)}</select>
+      <button type="button" class="btn ghost sm" onclick="removeSplitGroup(this)">删除此组</button>
+    </div>
+    <textarea class="sg-list mono" rows="3" style="min-height:72px" placeholder="一行一个域名或 IP/CIDR（命中则走上方所选 B 节点落地），例如：&#10;openai.com&#10;netflix.com&#10;1.1.1.0/24">${escHtml(listText || '')}</textarea>
+  </div>`;
+}
+
+// 实时同步组号与下拉防重：同一条链式规则中，已被其他分流组或兜底选中的 B 节点自动置灰
+function syncSplitSelects(){
+  const groups = [...document.querySelectorAll('#chRoutesBox .split-group')];
+  groups.forEach((g, idx) => {
+    const badge = g.querySelector('.sg-idx');
+    if (badge) badge.textContent = 'B' + (idx + 1);
+  });
+  const selects = groups.map(g => g.querySelector('.sg-bnode'));
+  const fallback = $('chFallbackB');
+  const chosen = selects.map(s => s.value).filter(Boolean);
+  selects.forEach(sel => {
+    [...sel.options].forEach(opt => {
+      if (!opt.value) return;
+      opt.disabled = (opt.value !== sel.value && chosen.includes(opt.value)) || (fallback && fallback.value && fallback.value === opt.value);
+    });
+  });
+  if (fallback){
+    [...fallback.options].forEach(opt => {
+      if (!opt.value) return;
+      opt.disabled = chosen.includes(opt.value);
+    });
+  }
+}
+
+function addSplitGroup(bnodeId, listText){
+  const box = $('chRoutesBox');
+  if (!box) return;
+  if (!bnodeId && BNODES.length){
+    const used = new Set([...box.querySelectorAll('.sg-bnode')].map(s => s.value));
+    if ($('chFallbackB') && $('chFallbackB').value) used.add($('chFallbackB').value);
+    const free = BNODES.find(b => !used.has(b.id));
+    if (free) bnodeId = free.id;
+  }
+  box.insertAdjacentHTML('beforeend', renderSplitGroupHTML(bnodeId || '', listText || ''));
+  syncSplitSelects();
+}
+
+function removeSplitGroup(btn){
+  const box = $('chRoutesBox');
+  if (!box || box.querySelectorAll('.split-group').length <= 1){
+    toast('多节点分流至少保留 1 个分流组', true);
+    return;
+  }
+  btn.closest('.split-group').remove();
+  syncSplitSelects();
+}
+
 function chModeChange(){
   const direct = document.querySelector('input[name="chMode"]:checked')?.value === 'direct';
-  const wrap = $('chListWrap');
-  if (wrap) wrap.style.display = direct ? 'none' : '';
+  if ($('chDirectWrap')) $('chDirectWrap').style.display = direct ? '' : 'none';
+  if ($('chSplitWrap')) $('chSplitWrap').style.display = direct ? 'none' : '';
 }
+
 function chainFormHTML(chain){
   const c = chain || {};
-  // 新建默认直接链式；编辑时按已有链式的方式来（老链式无 mode，默认分流）。
   const direct = chain ? c.mode === 'direct' : true;
+  let initRoutes = [];
+  if (!direct && Array.isArray(c.routes) && c.routes.length){
+    initRoutes = c.routes;
+  } else if (!direct && c.bnode_id && c.list){
+    initRoutes = [{ bnode_id: c.bnode_id, list: c.list }];
+  } else {
+    initRoutes = [{ bnode_id: BNODES[0] ? BNODES[0].id : '', list: '' }];
+  }
+  const fbBNode = (!direct && Array.isArray(c.routes) && c.routes.length) ? (c.bnode_id || '') : '';
   return `<div class="form-grid">
-    <div class="full"><label>链式名称</label><input id="chName" value="${escHtml(c.name || '')}" placeholder="留空自动命名"></div>
-    <div><label>A 节点</label><select id="chA">${vlessOptions(c.inbound_id || '', c.id || '')}</select><div class="hint">仅 VLESS 节点</div></div>
-    <div><label>B 节点</label><select id="chB">${bnodeOptions(c.bnode_id || '')}</select><div class="hint">先在入站列表的“其他节点”里添加</div></div>
-    <div class="full"><label>方式</label><div style="display:flex;gap:16px;flex-wrap:wrap">
-      <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="chMode" value="direct"${direct ? ' checked' : ''} onchange="chModeChange()">直接链式<span class="hint" style="margin:0">全部流量 A 进 B 出</span></label>
-      <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="chMode" value="split"${direct ? '' : ' checked'} onchange="chModeChange()">链式分流<span class="hint" style="margin:0">只有清单里的域名/IP 走B节点分流</span></label>
+    <div class="full"><label>链式规则名称</label><input id="chName" value="${escAttr(c.name || '')}" placeholder="留空自动命名"></div>
+    <div class="full">
+      <label>入口 A 节点（本机）</label>
+      <select id="chA">${chainAOptions(c.inbound_id || '', c.id || '')}</select>
+      <div class="hint">支持本机 VLESS / Hysteria2 / Trojan / VMess / TUIC / AnyTLS / Snell / ShadowTLS / SS / Naive / SOCKS / HTTP（仅 WireGuard 不支持）</div>
+    </div>
+    <div class="full"><label>转发策略</label><div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:4px">
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:500"><input type="radio" name="chMode" value="direct"${direct ? ' checked' : ''} onchange="chModeChange()">全局直通链式<span class="hint" style="margin:0">（全部流量 A 进 B 出）</span></label>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:500"><input type="radio" name="chMode" value="split"${direct ? '' : ' checked'} onchange="chModeChange()">多节点按清单分流<span class="hint" style="margin:0">（不同域名/IP 分别走 B1、B2、B3…）</span></label>
     </div></div>
-    <div class="full" id="chListWrap" style="display:${direct ? 'none' : ''}"><label>域名或 IP 清单（一行一个）</label><textarea id="chList" placeholder="example.com&#10;1.2.3.4/32">${escHtml(c.list || '')}</textarea></div>
+
+    <div class="full" id="chDirectWrap" style="display:${direct ? '' : 'none'}">
+      <label>落地 B 节点（外部）</label>
+      <select id="chB">${bnodeOptions(direct ? (c.bnode_id || '') : '', false)}</select>
+      <div class="hint">先在“外部落地节点”中导入</div>
+    </div>
+
+    <div class="full" id="chSplitWrap" style="display:${direct ? 'none' : ''}">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
+        <label style="margin:0">分流落地组（自动拦截重复域名、父子包含域名与重叠 IP 网段）</label>
+        <button type="button" class="btn ghost small" onclick="addSplitGroup()">＋ 添加 B 节点分流</button>
+      </div>
+      <div id="chRoutesBox">${initRoutes.map(r => renderSplitGroupHTML(r.bnode_id, r.list)).join('')}</div>
+      <div style="margin-top:6px">
+        <label>未命中以上清单的其余流量</label>
+        <select id="chFallbackB" onchange="syncSplitSelects()">${bnodeOptions(fbBNode, true)}</select>
+      </div>
+    </div>
   </div>`;
 }
 function openChainModal(){
-  openModal(`<h4>添加链式</h4>${chainFormHTML(null)}
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="chSaveBtn" onclick="saveChain(null)">保存</button></div>
-    <div class="msg" id="chMsg"></div>`);
+  openModal(`<h4>新建链式与分流规则</h4>${chainFormHTML(null)}
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="chSaveBtn" onclick="saveChain(null)">保存规则</button></div>
+    <div class="msg" id="chMsg"></div>`, true);
+  syncSplitSelects();
 }
 function openChainEditModal(id){
   const c = CHAINS.find(x => x.id === id);
   if (!c) return;
   openModal(`<h4>编辑链式：${escHtml(c.name)}</h4>${chainFormHTML(c)}
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="chSaveBtn" onclick="saveChain('${id}')">保存</button></div>
-    <div class="msg" id="chMsg"></div>`);
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" id="chSaveBtn" onclick="saveChain('${escAttr(id)}')">保存修改</button></div>
+    <div class="msg" id="chMsg"></div>`, true);
+  syncSplitSelects();
 }
 async function saveChain(id){
-  const a = $('chA').value, b = $('chB').value, name = $('chName').value.trim();
+  const a = $('chA').value, name = $('chName').value.trim();
   const mode = document.querySelector('input[name="chMode"]:checked')?.value || 'split';
-  const list = mode === 'direct' ? '' : $('chList').value.trim();
   if (id && !name){ $('chMsg').className = 'msg err'; $('chMsg').textContent = '链式名不能为空'; return; }
-  if (!a || !b){ $('chMsg').className = 'msg err'; $('chMsg').textContent = 'A 节点和 B 节点都要选'; return; }
+  if (!a){ $('chMsg').className = 'msg err'; $('chMsg').textContent = '请选择入口 A 节点'; return; }
   const aOpt = $('chA').selectedOptions[0];
   if (aOpt && aOpt.disabled){
     $('chMsg').className = 'msg err';
-    $('chMsg').textContent = '这个 A 节点选不了：' + (aOpt.text.includes('已有链式') ? '它已经有一条链式了，一个 A 节点只能有一条' : '只有 VLESS 能做 A 节点') + '。想再加一条，先去添加一个 VLESS 节点。';
+    $('chMsg').textContent = '这个 A 节点不可选：' + (aOpt.text.includes('已有链式') ? '它已经有一条链式规则了，请直接编辑那条规则添加分流组' : '该协议不支持作为入口 A');
     return;
   }
-  if (mode === 'split' && !list){ $('chMsg').className = 'msg err'; $('chMsg').textContent = '域名或 IP 清单不能为空'; return; }
+
+  const payload = { name, inbound_id: a, mode };
+  if (mode === 'direct'){
+    const b = $('chB').value;
+    if (!b){ $('chMsg').className = 'msg err'; $('chMsg').textContent = '请选择落地 B 节点'; return; }
+    payload.bnode_id = b;
+    payload.routes = [];
+  } else {
+    const groups = [...document.querySelectorAll('#chRoutesBox .split-group')];
+    if (!groups.length){ $('chMsg').className = 'msg err'; $('chMsg').textContent = '请至少添加 1 个分流组'; return; }
+    const routes = [];
+    for (let i = 0; i < groups.length; i++){
+      const bid = groups[i].querySelector('.sg-bnode').value;
+      const lst = groups[i].querySelector('.sg-list').value.trim();
+      if (!bid){ $('chMsg').className = 'msg err'; $('chMsg').textContent = `第 ${i + 1} 组未选择落地 B 节点`; return; }
+      if (!lst){ $('chMsg').className = 'msg err'; $('chMsg').textContent = `第 ${i + 1} 组的域名或 IP 清单不能为空`; return; }
+      routes.push({ bnode_id: bid, list: lst });
+    }
+    payload.routes = routes;
+    payload.bnode_id = $('chFallbackB') ? $('chFallbackB').value : '';
+  }
+
   const btn = $('chSaveBtn'); btn.disabled = true;
   try {
     if (id){
-      await api('/api/chains/' + id, 'PUT', { name, inbound_id: a, bnode_id: b, list, mode });
+      await api('/api/chains/' + encodeURIComponent(id), 'PUT', payload);
       toast('链式已保存');
     } else {
-      await api('/api/chains', 'POST', { name, inbound_id: a, bnode_id: b, list, mode });
+      await api('/api/chains', 'POST', payload);
       toast('链式规则已添加');
     }
     closeModal(); await loadChains();
@@ -1504,47 +1611,71 @@ async function saveChain(id){
 function renderChainRows(){
   const el = $('chainRows');
   if (!el) return;
-  if (!CHAINS.length){ el.innerHTML = '<div class="empty">还没有链式规则</div>'; return; }
+  if (!CHAINS.length){ el.innerHTML = '<div class="empty">还没有链式代理规则</div>'; return; }
   el.innerHTML = CHAINS.map(c => {
     const a = NODES.find(n => n.id === c.inbound_id);
-    const b = BNODES.find(x => x.id === c.bnode_id);
-    const lines = (c.list || '').split('\n').filter(x => x.trim()).length;
+    const aDesc = a ? `${escHtml(a.name)} (${escHtml(a.protocol.toUpperCase())})` : escHtml(c.inbound_id);
+    let targetDesc = '';
+    if (c.mode === 'direct'){
+      const b = BNODES.find(x => x.id === c.bnode_id);
+      targetDesc = `落地 B：${b ? escHtml(b.name) : escHtml(c.bnode_id)} · 全局流量直通`;
+    } else {
+      const rts = (c.routes && c.routes.length) ? c.routes : (c.bnode_id ? [{ bnode_id: c.bnode_id, list: c.list || '' }] : []);
+      const parts = rts.map((r, i) => {
+        const b = BNODES.find(x => x.id === r.bnode_id);
+        const cnt = (r.list || '').split('\n').filter(x => x.trim() && !x.trim().startsWith('#')).length;
+        return `B${i + 1}:${b ? escHtml(b.name) : escHtml(r.bnode_id)}(${cnt}条)`;
+      });
+      const fb = (c.routes && c.routes.length && c.bnode_id) ? BNODES.find(x => x.id === c.bnode_id) : null;
+      targetDesc = `分流：${parts.join(' / ')} · 其余：${fb ? escHtml(fb.name) : '本机直连'}`;
+    }
+    const cid = escAttr(c.id);
     return `<div class="row">
-      <button class="menu-btn" title="设置" onclick="openChainMenu(this,'${c.id}')">⋮</button>
-      <input type="checkbox" class="switch" ${c.enabled ? 'checked' : ''} onchange="toggleChain('${c.id}', this.checked)">
+      <button class="menu-btn" title="操作" onclick="openChainMenu(this,'${cid}')">⋮</button>
+      <input type="checkbox" class="switch" ${c.enabled ? 'checked' : ''} onchange="toggleChain('${cid}', this.checked)">
       <div class="grow"><div class="t">${escHtml(c.name)}</div>
-        <div class="s">A：${a ? escHtml(a.name) : c.inbound_id} → B：${b ? escHtml(b.name) : c.bnode_id} · ${c.mode === 'direct' ? '全部流量' : ('清单 ' + lines + ' 条')} · ${c.enabled ? '生效中' : '已停用'}</div></div>
+        <div class="s">入口 A：${aDesc} → ${targetDesc} · ${c.enabled ? '生效中' : '已停用'}</div></div>
     </div>`;
   }).join('');
 }
 function openChainMenu(btn, id){
   const c = CHAINS.find(x => x.id === id);
   if (!c) return;
+  const cid = escAttr(id);
   openDropdown(btn, `
-    <button onclick="closeDropdown();showChainLink('${id}')">${MI.link}链式链接</button>
-    <button onclick="closeDropdown();openChainEditModal('${id}')">${MI.edit}编辑</button>
-    <button class="danger" onclick="closeDropdown();delChain('${id}','${escHtml(c.name)}')">${MI.trash}删除</button>`);
+    <button onclick="closeDropdown();showChainLink('${cid}')">${MI.link}链式连接链接</button>
+    <button onclick="closeDropdown();openChainEditModal('${cid}')">${MI.edit}编辑规则</button>
+    <button class="danger" onclick="closeDropdown();delChain('${cid}')">${MI.trash}删除规则</button>`);
 }
 async function showChainLink(id){
   const c = CHAINS.find(x => x.id === id);
   if (!c) return;
+  const a = NODES.find(n => n.id === c.inbound_id);
+  const isMultiline = a && (a.protocol === 'naive' || a.protocol === 'wireguard');
   try {
-    const r = await api('/api/chains/' + id + '/link');
-    const link6Field = !r.link6 ? '' : `<div style="margin-top:12px"><label>链式链接 IPv6</label><div class="input-row"><input id="lkChain6" readonly value="${escHtml(r.link6)}"><button class="btn ghost small" onclick="copyText('lkChain6')">复制</button></div></div>`;
-    openModal(`<h4>${escHtml(c.name)} · 链式链接</h4>
-      <label>链式链接（客户端连 A，链式在服务端完成）</label><div class="input-row"><input id="lkChain" readonly value="${escHtml(r.link)}"><button class="btn ghost small" onclick="copyText('lkChain')">复制</button></div>
+    const r = await api('/api/chains/' + encodeURIComponent(id) + '/link');
+    const mainField = isMultiline
+      ? `<label>链式客户端配置（客户端直连入口 A，服务端自动按规则分流）</label><textarea id="lkChain" readonly rows="10" style="width:100%" class="mono">${escHtml(r.link)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkChain')">复制配置</button></div>`
+      : `<label>链式链接（客户端直连入口 A，链式转发在服务端自动完成）</label><div class="input-row"><input id="lkChain" readonly value="${escAttr(r.link)}"><button class="btn ghost small" onclick="copyText('lkChain')">复制</button></div>`;
+    const link6Field = !r.link6 ? '' : (isMultiline
+      ? `<div style="margin-top:12px"><label>链式客户端配置 IPv6</label><textarea id="lkChain6" readonly rows="10" style="width:100%" class="mono">${escHtml(r.link6)}</textarea><div style="margin-top:8px"><button class="btn ghost small" onclick="copyText('lkChain6')">复制配置</button></div></div>`
+      : `<div style="margin-top:12px"><label>链式链接 IPv6</label><div class="input-row"><input id="lkChain6" readonly value="${escAttr(r.link6)}"><button class="btn ghost small" onclick="copyText('lkChain6')">复制</button></div></div>`);
+    openModal(`<h4>${escHtml(c.name)} · 链式连接凭证</h4>
+      ${mainField}
       ${link6Field}
-      <div class="qr-box"><img src="${(window.PANEL_BASE||'')}/api/chains/${id}/qr" alt="二维码"></div>
+      <div class="qr-box"><img src="${escAttr((window.PANEL_BASE||'') + '/api/chains/' + encodeURIComponent(id) + '/qr')}" alt="二维码"></div>
       <div class="foot"><button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
   } catch(e){ toast(e.message, true); }
 }
 async function toggleChain(id, enable){
-  try { await api('/api/chains/' + id, 'PUT', { enabled: enable }); loadChains(); }
+  try { await api('/api/chains/' + encodeURIComponent(id), 'PUT', { enabled: enable }); loadChains(); }
   catch(e){ toast(e.message, true); loadChains(); }
 }
-function delChain(id, name){
-  confirmModal('删除链式规则', `确定删除 <b>${name}</b> 吗？`, '删除', async ()=>{
-    await api('/api/chains/' + id, 'DELETE');
+function delChain(id){
+  const c = CHAINS.find(x => x.id === id);
+  if (!c) return;
+  confirmModal('删除链式规则', `确定删除 <b>${escHtml(c.name)}</b> 吗？`, '确认删除', async ()=>{
+    await api('/api/chains/' + encodeURIComponent(id), 'DELETE');
     toast('已删除'); loadChains();
   });
 }
@@ -1567,7 +1698,7 @@ async function loadSettings(){
   } catch(e){}
   try {
     const t = await api('/api/settings/2fa/status');
-    if ($('tfaStatus')) $('tfaStatus').textContent = t.broken ? '密钥损坏（请用本机 SSH 菜单关闭二次验证后重新开通）' : (t.enabled ? ('已开通（剩余恢复码 ' + t.recovery_left + ' 个）') : '未开通');
+    if ($('tfaStatus')) $('tfaStatus').textContent = t.broken ? '密钥损坏（请用本机 SSH 菜单关闭二次验证后重新开通）' : (t.enabled ? ('已开启保护（剩余一次性恢复码 ' + t.recovery_left + ' 个）') : '尚未开通两步验证');
     if ($('tfaOpenBtn')) $('tfaOpenBtn').style.display = t.enabled ? 'none' : '';
     if ($('tfaCloseBtn')) $('tfaCloseBtn').style.display = t.enabled ? '' : 'none';
   } catch(e){}
@@ -1577,8 +1708,6 @@ async function savePanelAccess(){
   const portRaw = parseInt($('accPort').value, 10), path = $('accPath').value.trim();
   const msg = $('accMsg'); msg.className = 'hint'; msg.textContent = '正在保存…';
   try {
-    // 端口+路径一次请求改完：以前先改路径、再改端口，第二步还带着旧路径
-    // 前缀，新路径门一挡就是 404（路径改成了、端口没改成）。
     const port = isNaN(portRaw) ? ACC_LOADED.port : portRaw;
     const r = await api('/api/settings/panel-access', 'POST', { port, path });
     const host = location.hostname.includes(':') ? '[' + location.hostname + ']' : location.hostname;
@@ -1586,7 +1715,6 @@ async function savePanelAccess(){
     const curPort = location.port ? parseInt(location.port, 10) : (location.protocol === 'https:' ? 443 : 80);
     const portChanged = r.port !== curPort, pathChanged = base !== (window.PANEL_BASE || '');
     if (r.restart_required){
-      // 端口没自动重启：路径已立即生效，先跳到新路径（旧端口），端口等手动重启后用新端口。
       if (pathChanged){
         msg.className = 'hint';
         msg.textContent = '路径已生效，端口已写入服务文件但不会自动重启（手动部署），手动重启后请用新地址：' + location.protocol + '//' + host + ':' + r.port + base + '/' + (r.note ? '（' + r.note + '）' : '');
@@ -1611,7 +1739,6 @@ async function savePanelAccess(){
   } catch(e){ msg.className = 'hint'; msg.textContent = ''; toast(e.message, true); }
 }
 async function waitForPanel(url){
-  // 新端口未必立刻就绪：探到通了再跳，最多等约 20 秒；超时也跳过去让用户自己刷新。
   for (let i = 0; i < 50; i++){
     try { await fetch(url, { mode: 'no-cors' }); return; } catch(e){}
     await new Promise(r => setTimeout(r, 400));
@@ -1624,13 +1751,14 @@ async function open2faBegin(){
   } catch(e){ toast(e.message, true); }
 }
 function open2faModal(r){
-  openModal(`<h4>开通二次验证（2FA）</h4>
-    <div class="muted" style="padding:4px 0 10px">用验证器 App 扫码，或手动输入密钥；然后输入一次动态码，开通后会给出 10 个一次性恢复码（只显示一次），请妥善保存。</div>
-    <div style="text-align:center"><img src="${r.qr}" style="width:180px;height:180px;border:1px solid #e5e7eb;border-radius:12px"></div>
-    <label>手动密钥（可复制）</label><div class="input-row"><input id="tfaSecret" readonly value="${escHtml(r.secret)}"><button class="btn ghost small" onclick="copyText('tfaSecret')">复制</button><button class="btn ghost small" onclick="regen2faSecret()">换一个</button></div>
-    <div class="hint">每次打开与每次刷新都会重新随机生成，不是固定默认值。</div>
-    <label>动态码</label><input id="tfaCode" inputmode="numeric" placeholder="6 位动态码">
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" onclick="enable2fa()">输入正确后开通</button></div>
+  const safeQr = (r.qr && String(r.qr).startsWith('data:image/png;base64,')) ? escAttr(r.qr) : '';
+  openModal(`<h4>开通两步验证（2FA）</h4>
+    <div class="muted" style="padding:4px 0 12px">使用验证器 App 扫描二维码或手动输入密钥；随后输入 6 位动态码完成绑定。绑定成功后将生成 10 个一次性恢复码，请务必妥善保存。</div>
+    <div style="text-align:center;margin:8px 0 14px"><img src="${safeQr}" style="width:184px;height:184px;border:1px solid var(--line-subtle);border-radius:16px;padding:6px;background:#fff;box-shadow:var(--shadow-sm)"></div>
+    <label>手动密钥（可复制）</label><div class="input-row"><input id="tfaSecret" readonly value="${escAttr(r.secret)}"><button class="btn ghost small" onclick="copyText('tfaSecret')">复制</button><button class="btn ghost small" onclick="regen2faSecret()">换一个</button></div>
+    <div class="hint">每次打开与刷新均重新随机生成密钥。</div>
+    <div style="margin-top:12px"><label>验证器 6 位动态码</label><input id="tfaCode" inputmode="numeric" placeholder="请输入 6 位数字动态码"></div>
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" onclick="enable2fa()">验证并开通</button></div>
     <div class="msg" id="tfaModalMsg"></div>`);
 }
 async function regen2faSecret(){
@@ -1645,18 +1773,18 @@ async function enable2fa(){
   try {
     const r = await api('/api/settings/2fa/enable', 'POST', { code });
     const codes = (r.recovery || []).join('\n');
-    openModal(`<h4>2FA 已开通</h4>
-      <div class="muted" style="padding:4px 0 10px">下面是 10 个一次性恢复码，<b>只显示这一次</b>，丢了验证器时靠它登录，用一次少一个。请复制保存好再关闭。</div>
-      <textarea id="tfaRecovery" readonly rows="11" style="width:100%;font-family:monospace">${escHtml(codes)}</textarea>
-      <div class="foot"><button class="btn ghost" onclick="copyText('tfaRecovery')">复制全部</button><button class="btn" onclick="closeModal();loadSettings()">我已保存好</button></div>`);
+    openModal(`<h4>两步验证（2FA）已成功开通</h4>
+      <div class="muted" style="padding:4px 0 12px">以下是您的 10 个一次性紧急恢复码，<b>仅显示这一次</b>。遗失手机验证器时凭恢复码登录，用一次少一个。请立即复制并妥善保存。</div>
+      <textarea id="tfaRecovery" readonly rows="11" style="width:100%" class="mono">${escHtml(codes)}</textarea>
+      <div class="foot"><button class="btn ghost" onclick="copyText('tfaRecovery')">复制全部恢复码</button><button class="btn" onclick="closeModal();loadSettings()">我已妥善保存</button></div>`);
     toast('2FA 已开通');
   } catch(e){ $('tfaModalMsg').className = 'msg err'; $('tfaModalMsg').textContent = e.message; }
 }
 function open2faDisable(){
-  openModal(`<h4>关闭二次验证（2FA）</h4>
-    <div class="muted" style="padding:4px 0 10px">关闭后登录不再要动态码，恢复码同时作废。请输入一次当前动态码（或任意一个未用的恢复码）确认。</div>
-    <label>动态码或恢复码</label><input id="tfaOffCode" placeholder="6 位动态码或 XXXX-XXXX 恢复码">
-    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn" onclick="disable2fa()">确认关闭</button></div>
+  openModal(`<h4>关闭两步验证（2FA）</h4>
+    <div class="muted" style="padding:4px 0 12px">关闭后登录不再要求动态码，现有恢复码同时作废。请输入当前 6 位动态码（或任意未使用的恢复码）以确认身份。</div>
+    <label>动态码或恢复码</label><input id="tfaOffCode" placeholder="6 位动态码 或 XXXX-XXXX 恢复码">
+    <div class="foot"><button class="btn ghost" onclick="closeModal()">取消</button><button class="btn red" onclick="disable2fa()">确认关闭 2FA</button></div>
     <div class="msg" id="tfaOffMsg"></div>`);
 }
 async function disable2fa(){
@@ -1679,9 +1807,8 @@ async function saveLogin(){
     $('newUser').value = ''; $('pwNew').value = ''; $('pwOld').value = '';
   } catch(e){ toast(e.message, true); }
 }
+
 // ---------- 在线更新 ----------
-// 自动检查：打开面板设置时查一次；面板启动后后台每 12 小时再查一次
-// （服务端存着最新版和检查时间）。更新永远手动点，不自动装。
 let UPD_LATEST = '';
 async function checkUpdate(auto){
   const msg = $('updMsg'); if (!msg) return;
@@ -1696,7 +1823,7 @@ async function checkUpdate(auto){
     UPD_LATEST = r.latest || '';
     const apply = $('updApplyBtn');
     if (apply) apply.disabled = !r.has_update;
-    msg.textContent = r.has_update ? ('有新版 ' + r.latest + '，点“更新到最新版”手动更新。') : (r.latest ? '已是最新版。' : '没查到新版信息，稍后再试。');
+    msg.textContent = r.has_update ? ('发现新版本 ' + r.latest + '，点击“更新到最新版”即可在线升级。') : (r.latest ? '当前已是最新版本。' : '暂未查到新版信息，请稍后再试。');
   } catch(e){
     UPD_LATEST = '';
     msg.textContent = '检查失败：' + e.message;
@@ -1729,9 +1856,6 @@ async function applyUpdate(){
     }
     msg.textContent = '已更新到 ' + r.version + '，面板正在重启…';
     btn.textContent = '重启中…';
-    // 重启后内存会话全清，必须重新登录；轮询面板起来后整页刷新
-    // （只切登录视图不刷新，旧 app.js 会继续跑，新版 JS 永远上不了线，
-    // 在线升级完二维码这类前端修复看起来“没生效”就是这么来的）。
     let tries = 0, lastVer = '';
     const normVer = v => (v || '').replace(/^v/, '');
     const target = normVer(r.version);
@@ -1742,19 +1866,11 @@ async function applyUpdate(){
       try {
         const resp = await fetch((window.PANEL_BASE || '') + '/api/setup-status', { signal: ctl.signal });
         if (!resp.ok) throw new Error('not up');
-        // setup-status 的版本号包在 data 里（okJSON 统一包一层），直接读
-        // 顶层永远是 undefined，轮询永远等不到新版（教训：更新明明
-        // 成功了，页面却在“重启中…”卡 90 秒然后谎称更新未生效）。
         const st = (await resp.json()).data || {};
         if (st.version) lastVer = st.version;
-        // 旧版 setup-status 不带 version（没重启还是旧版时 version 为空），
-        // 只有新版号对上了才算真成功；光通着不算（v1.0.1 教训：旧进程
-        // 一直通着，前端却谎称更新完成）。
         if (st.version && normVer(st.version) === target) {
           clearInterval(wait);
           clearTimeout(to);
-          // 只有用户确实还在设置页（更新界面）、没开弹窗、没在输入时才自动刷新；
-          // 否则只改文案提示手动刷新，别打断用户当前操作。
           const onSettings = $('view-settings') && $('view-settings').classList.contains('on');
           const modalOpen = $('overlay') && $('overlay').classList.contains('on');
           const ae = document.activeElement;
@@ -1786,16 +1902,12 @@ function panelCertDomain(id){
   for (const x of PANEL_CERTS || []) if (x.id === id) return (x.domains || [])[0] || '';
   return '';
 }
-// HTTPS 提示地址：当前选用证书的首域名（证书域名就是面板域名），
-// 没有证书才回落到当前访问 host。端口一律用当前访问端口（面板端口）。
-// 地址带上当前根路径：防扫门要求非本机访问带路径前缀，裸地址会 404。
 function panelHttpsUrl(certId){
   const host = panelCertDomain(certId || PANEL_CERT_ID) || location.hostname;
   const port = location.port ? ':' + location.port : '';
   const base = (window.PANEL_BASE || '');
   return 'https://' + host + port + base + (base ? '/' : '');
 }
-// 启用按钮跟随状态：启用后显示“已启用”（只改文案，换证书时可直接重启用）。
 function setPanelHttpsBtn(enabled){
   const b = $('panelHttpsEnable'); if (!b) return;
   b.textContent = enabled ? '已启用' : '启用 HTTPS';
@@ -1811,14 +1923,14 @@ async function loadPanelCerts(){
     PANEL_CERTS = list; PANEL_CERT_ID = c.panel_cert || '';
     const box = $('panelCertList'); if (!box) return;
     if (!list.length){
-      box.textContent = '还没有证书：先手动添加或在线申请一张，再选它启用 HTTPS。';
+      box.textContent = '还没有证书：先手动上传或 ACME 在线申请一张，再选它启用 HTTPS。';
     } else {
       box.innerHTML = list.map(x => {
         const exp = x.days_left === -9999 ? '到期未知'
           : (x.days_left < 0 ? '已过期 ' + (-x.days_left) + ' 天' : '剩余 ' + x.days_left + ' 天');
-        return '<div>' + escHtml(x.name) + '（' + escHtml((x.domains || []).join('、')) + '，' + exp
-          + '，' + (x.auto_renew ? '自动续签' : '不自动续签')
-          + (x.selected ? '，面板当前选用' : '') + '）</div>';
+        return '<div style="padding:4px 0">' + escHtml(x.name) + '（' + escHtml((x.domains || []).join('、')) + ' · ' + exp
+          + ' · ' + (x.auto_renew ? '自动续签' : '不自动续签')
+          + (x.selected ? ' · <b style="color:var(--primary)">当前选用</b>' : '') + '）</div>';
       }).join('');
     }
     const sel = $('panelHttpsCert'); if (sel){
@@ -1830,9 +1942,9 @@ async function loadPanelCerts(){
       if (c.panel_https){
         const u = panelHttpsUrl(c.panel_cert);
         hint.innerHTML = 'HTTPS 已启用（证书：' + escHtml(panelCertNameById(list, c.panel_cert))
-          + '）。请用 <a href="' + escHtml(u) + '">' + escHtml(u) + '</a> 访问面板。';
+          + '）。请使用 <a href="' + escHtml(u) + '">' + escHtml(u) + '</a> 访问面板。';
       } else {
-        hint.textContent = '当前走 HTTP。选一张证书并启用 HTTPS 后，面板地址变为 https。';
+        hint.textContent = '当前走 HTTP。选一张证书并启用 HTTPS 后，面板支持加密访问。';
       }
       setPanelHttpsBtn(!!c.panel_https);
     }
@@ -1848,9 +1960,8 @@ async function savePanelHttps(enable){
       '启用后，面板同时支持两种打开方式：<a href="' + escHtml(u) + '">' + escHtml(u) + '</a>（加密，日常用这个）；http://' + location.host + base + (base ? '/' : '') + ' 也能打开，但是明文，登录信息不加密，只当备用入口。证书丢了/过期，重启面板会自动回落 HTTP。',
       '确定启用', async ()=>{
       await api('/api/settings/panel-https', 'POST', { enabled: true, cert });
-      // 启用后 http 页仍可调接口（双协议），直接把 https 链接写进提示。
       const hint = $('panelHttpsHint'); if (hint){
-        hint.innerHTML = 'HTTPS 已启用。请用 <a href="' + escHtml(u) + '">' + escHtml(u) + '</a> 访问面板。';
+        hint.innerHTML = 'HTTPS 已启用。请使用 <a href="' + escHtml(u) + '">' + escHtml(u) + '</a> 访问面板。';
       }
       setPanelHttpsBtn(true);
       toast('HTTPS 已启用，请用 https 地址访问面板');
@@ -1859,19 +1970,17 @@ async function savePanelHttps(enable){
     try {
       await api('/api/settings/panel-https', 'POST', { enabled: false });
       setPanelHttpsBtn(false);
-      // 服务器已切回 HTTP：当前若是 https 页，刷新会失败，直接跳回 http。
       location.href = 'http://' + location.host + location.pathname;
     } catch(e){ toast(e.message, true); }
   }
 }
 function openManualCertDialog(){
-  openModal('<h3>手动添加证书</h3><div class="form-grid">'
-    + '<div class="full"><label>证书名（备注，留空 = 用证书里的第一域名）</label><input id="mCertName"></div>'
+  openModal('<h3>手动上传证书</h3><div class="form-grid">'
+    + '<div class="full"><label>证书备注名（留空 = 自动取证书首域名）</label><input id="mCertName"></div>'
     + '<div class="full"><label>证书文件（.crt / .pem，须与私钥成对）</label><input id="mCertFile" type="file"></div>'
     + '<div class="full"><label>私钥文件（.key）</label><input id="mCertKey" type="file"></div>'
-    + '<div class="full"><button class="btn" onclick="uploadPanelCert()">上传添加</button>'
-    + '<button class="btn ghost" onclick="closeModal()">关闭</button></div>'
-    + '<div class="full"><div class="hint" id="mCertResult"></div></div></div>');
+    + '<div class="full"><div class="hint" id="mCertResult"></div></div></div>'
+    + '<div class="foot"><button class="btn ghost" onclick="closeModal()">关闭</button><button class="btn" onclick="uploadPanelCert()">上传并添加</button></div>');
 }
 async function uploadPanelCert(){
   const name = $('mCertName').value.trim();
@@ -1893,20 +2002,19 @@ async function uploadPanelCert(){
 async function openAcmeDialog(){
   let configured = false;
   try { const c = await api('/api/settings/certs'); configured = !!c.cf_token_configured; } catch(e){}
-  openModal('<h3>在线申请证书</h3><div class="form-grid">'
-    + '<div class="full"><label>域名（一行一个，首域名决定证书存放名）</label><textarea id="aCertDomains" rows="3"></textarea></div>'
-    + '<div class="full"><label>证书名（备注，留空 = 用首域名）</label><input id="aCertName"></div>'
+  openModal('<h3>ACME 在线申请证书</h3><div class="form-grid">'
+    + '<div class="full"><label>域名列表（一行一个，首域名决定证书存放目录名）</label><textarea id="aCertDomains" rows="3" placeholder="example.com"></textarea></div>'
+    + '<div class="full"><label>证书备注名（留空 = 用首域名）</label><input id="aCertName"></div>'
     + '<div class="full"><label>验证方式</label><select id="aCertMethod">'
     + '<option value="">自动（80 空闲走 HTTP-01，80 被占走 DNS-01）</option>'
     + '<option value="http-01">HTTP-01（需 80 端口空闲）</option>'
     + '<option value="dns-01">DNS-01（需 Cloudflare Token）</option></select></div>'
-    + '<div class="full"><label>Cloudflare API Token（DNS-01 用，需对应域名的 DNS 编辑权限；只存服务器本地，用于自动续期）</label>'
+    + '<div class="full"><label>Cloudflare API Token（DNS-01 用，需对应域名的 DNS 编辑权限；仅存本机用于续期）</label>'
     + '<input id="aCertToken" type="password" placeholder="' + (configured ? '已保存 Token（留空表示沿用，填新值则覆盖）' : 'Cloudflare API Token') + '"></div>'
-    + '<div class="full"><label><input type="checkbox" id="aCertRenew" checked> 自动续签（到期前 30 天自动续期）</label></div>'
+    + '<div class="full"><label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="aCertRenew" checked> 开启自动续签（到期前 30 天自动续期）</label></div>'
     + '<div class="full"><div class="hint">自动：80 空闲走 HTTP-01，80 被占走 DNS-01（需 Token）。通配符域名只能 DNS-01。</div></div>'
-    + '<div class="full"><button class="btn" onclick="applyAcme()">开始申请</button>'
-    + '<button class="btn ghost" onclick="closeModal()">关闭</button></div>'
-    + '<div class="full"><div class="hint" id="aCertResult"></div></div></div>');
+    + '<div class="full"><div class="hint" id="aCertResult" style="color:var(--primary);font-weight:500"></div></div></div>'
+    + '<div class="foot"><button class="btn ghost" onclick="closeModal()">关闭</button><button class="btn" onclick="applyAcme()">开始申请</button></div>');
 }
 async function applyAcme(){
   const domains = $('aCertDomains').value.split('\n').map(s => s.trim()).filter(Boolean);
@@ -1924,7 +2032,7 @@ async function applyAcme(){
   } catch(e){ res.textContent = '失败：' + e.message; }
 }
 async function pollAcmeStatus(){
-  const el = $('aCertResult'); if (!el) return; // 弹窗已关就停，不再轮询
+  const el = $('aCertResult'); if (!el) return;
   try {
     const j = await api('/api/settings/cert-acme-status');
     if (j.running){
@@ -1939,7 +2047,6 @@ async function pollAcmeStatus(){
     }
   } catch(e){ el.textContent = '状态查询失败：' + e.message; }
 }
-// 订阅链接 host：证书域名（面板域名和证书卡里绑定的）> 当前访问 host。
 function subLinkValue(token){
   const host = panelCertDomain(PANEL_CERT_ID) || location.hostname;
   const scheme = location.protocol === 'https:' ? 'https' : 'http';
@@ -1947,23 +2054,21 @@ function subLinkValue(token){
   return scheme + '://' + host + port + '/sub/' + token;
 }
 async function openSubModal(){
-  openModal(`<h4>订阅配置</h4><div class="muted" style="padding:8px 0">正在读取订阅…</div>`);
+  openModal(`<h4>多端统一订阅配置</h4><div class="muted" style="padding:8px 0">正在读取订阅信息…</div>`);
   try {
     const s = await api('/api/settings');
     const link = subLinkValue(s.sub_token);
     const excluded = new Set(s.sub_excluded || []);
     const locals = (NODES || []).map(n => `<div class="row"><input type="checkbox" class="sub-check" data-key="in:${n.id}" ${excluded.has('in:' + n.id) ? '' : 'checked'}><div class="grow"><div class="t">${escHtml(n.name)} ${protoBadge(n.protocol)}</div><div class="s">本地节点 · ${n.enabled ? '启用中' : '已停用（停用的节点订阅里也不会出）'}</div></div></div>`).join('');
-    const others = (BNODES || []).map(b => `<div class="row"><input type="checkbox" class="sub-check" data-key="bn:${b.id}" ${excluded.has('bn:' + b.id) ? '' : 'checked'}><div class="grow"><div class="t">${escHtml(b.name)} ${protoBadge(b.protocol)}</div><div class="s">其他节点</div></div></div>`).join('');
-    openModal(`<h4>订阅配置</h4>
-      <label>订阅链接（链接列表，v2rayN / Shadowrocket / NekoBox）</label><div class="input-row"><input id="subLink" readonly value="${escHtml(link)}"><button class="btn ghost small" onclick="copyText('subLink')">复制</button><button class="btn ghost small" onclick="regenSubFromModal()">换一个</button></div>
-      <label>sing-box JSON（Hiddify / sing-box / Karing，全部协议）</label><div class="input-row"><input id="subLinkSingbox" readonly value="${escHtml(link + '?format=singbox')}"><button class="btn ghost small" onclick="copyText('subLinkSingbox')">复制</button></div>
-      <label>Clash YAML（mihomo / Clash Verge / Stash）</label><div class="input-row"><input id="subLinkClash" readonly value="${escHtml(link + '?format=clash')}"><button class="btn ghost small" onclick="copyText('subLinkClash')">复制</button></div>
-      <div class="hint">同一订阅链接会按客户端自动识别格式；上面是各客户端的专属链接。WireGuard 没有单行链接形式，只在 JSON 与 YAML 里；Snell v6 只在 JSON 里（mihomo 没有 v6）；ShadowTLS 不在链接列表里（链接里的插件形式在 Hiddify 与 mihomo 里都实测不通），sing-box/Hiddify 走 JSON，mihomo 走 YAML；v2rayN 用不了 ShadowTLS/Snell/AnyTLS/Naive。</div>
-      <div class="hint">默认包含全部节点；取消勾选、点保存后，客户端刷新订阅就变了。</div>
-      <div style="margin-top:14px"><label>订阅包含的节点（默认全选）</label>${locals || '<div class="muted">暂无本地节点</div>'}${others}</div>
-      <div class="hint">要加其他服务器的节点，去入站列表的“其他节点”里添加，那里添加的默认就进订阅。</div>
-      <div class="foot"><button class="btn ghost" onclick="closeModal()">关闭</button><button class="btn" id="subSaveBtn" onclick="saveSubSelection()">保存</button></div>
-      <div class="msg" id="subMsg"></div>`);
+    const others = (BNODES || []).map(b => `<div class="row"><input type="checkbox" class="sub-check" data-key="bn:${b.id}" ${excluded.has('bn:' + b.id) ? '' : 'checked'}><div class="grow"><div class="t">${escHtml(b.name)} ${protoBadge(b.protocol)}</div><div class="s">外部节点</div></div></div>`).join('');
+    openModal(`<h4>多端统一订阅配置</h4>
+      <div style="margin-bottom:10px"><label>通用订阅链接（Base64 链接列表，适配 v2rayN / Shadowrocket / NekoBox）</label><div class="input-row"><input id="subLink" readonly value="${escHtml(link)}"><button class="btn ghost small" onclick="copyText('subLink')">复制</button><button class="btn ghost small" onclick="regenSubFromModal()">重置令牌</button></div></div>
+      <div style="margin-bottom:10px"><label>Sing-box 专属订阅（JSON 完整配置，适配 Hiddify / Sing-box / Karing，支持全部 13 种协议）</label><div class="input-row"><input id="subLinkSingbox" readonly value="${escHtml(link + '?format=singbox')}"><button class="btn ghost small" onclick="copyText('subLinkSingbox')">复制</button></div></div>
+      <div style="margin-bottom:10px"><label>Clash Mihomo 专属订阅（YAML 配置，适配 Clash Verge / FlClash / Stash）</label><div class="input-row"><input id="subLinkClash" readonly value="${escHtml(link + '?format=clash')}"><button class="btn ghost small" onclick="copyText('subLinkClash')">复制</button></div></div>
+      <div class="hint">同一订阅链接支持按客户端 User-Agent 自动识别格式；也可直接复制上方带参数的专属链接。WireGuard 仅在 Sing-box JSON 与 Clash YAML 中下发。</div>
+      <div style="margin-top:16px"><label>勾选包含在订阅中的节点（默认全选）</label><div style="max-height:220px;overflow-y:auto;border:1px solid var(--line-subtle);border-radius:var(--r-md);padding:4px 8px;background:rgba(248,250,252,.7)">${locals || '<div class="muted" style="padding:10px">暂无本地节点</div>'}${others}</div></div>
+      <div class="foot"><button class="btn ghost" onclick="closeModal()">关闭</button><button class="btn" id="subSaveBtn" onclick="saveSubSelection()">保存节点勾选</button></div>
+      <div class="msg" id="subMsg"></div>`, true);
   } catch(e){ toast(e.message, true); }
 }
 async function saveSubSelection(){
@@ -1984,6 +2089,8 @@ async function regenSubFromModal(){
     try {
       const r = await api('/api/settings/sub-token', 'POST', {});
       $('subLink').value = subLinkValue(r.sub_token);
+      if ($('subLinkSingbox')) $('subLinkSingbox').value = subLinkValue(r.sub_token) + '?format=singbox';
+      if ($('subLinkClash')) $('subLinkClash').value = subLinkValue(r.sub_token) + '?format=clash';
       toast('订阅链接已更换，旧链接已失效');
     } catch(e){ toast(e.message, true); }
   });
@@ -1991,8 +2098,7 @@ async function regenSubFromModal(){
 
 // ---------- boot ----------
 async function refreshAll(){
-  // 先 loadChains（填 NODES）再 refreshStatus：否则首绘时 renderUsage/
-  // renderLocalRows 读到的 NODES 为空，协议文案回落默认，要等 5 秒轮询才补全。
+  await loadPanelCerts();
   await loadChains();
   await refreshStatus();
   await loadSettings();

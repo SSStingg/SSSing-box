@@ -11,15 +11,16 @@ import (
 //
 // 本地入站 → sing-box 客户端出站。字段与入站生成器、链接生成器
 // 逐项对齐：同一份配置，服务端入站怎么接，客户端出站就怎么写。
-// 关键映射（别家客户端同款，见 2026-11-12 订阅多格式调研）：
+// 关键映射：
 //   - Snell：入站 5/6，出站只认 4/6——服务端 v5 必须写出站 version=4，
-//     v5 的 TCP 线协议与 v4 相同（官方文档原话），没有 v5 客户端。
-//   - Reality 出站：sing-box 强制要求 utls（Trojan 已踩过坑），
-//     fingerprint 取入站配置，缺省 chrome。
+//     v5 的 TCP 线协议与 v4 相同，没有 v5 客户端。
+//   - Reality 出站：sing-box 强制要求 utls，fingerprint 取入站配置，缺省 chrome。
 //   - ShadowTLS：没有 URL 链接，固定两个出站（SS detour 到 shadowtls），
 //     直接复用 ShadowTLSClientJSON 的产出。
 //   - WireGuard：sing-box 1.13 起出站已移除，改 endpoints 段端点；
-//     端点 tag 直接用节点名，选单里引用它（sing-box check 实测）。
+//     端点 tag 直接用节点名，选单里引用它。
+//   - H2 传输：sing-box 没有 "h2" 传输类型，客户端与服务端统一写 "type": "http"
+//     且 host 为字符串数组，配合 TLS 自动协商 HTTP/2。
 
 // ClientOutbounds：本地入站 → 客户端出站（+ WireGuard 端点）。
 // address 是订阅用的服务器地址（域名或公网 IP），sni 是入站 SNI，
@@ -168,10 +169,10 @@ func ClientOutbounds(protocol, configJSON, address string, port int, sni, name s
 		if cfg.ObfsType == "salamander" {
 			ob["obfs"] = map[string]interface{}{"type": "salamander", "password": cfg.ObfsPassword}
 		}
-		// 限速必须是数字：Hy2Config 里存的是字符串（面板表单就是字符串），
-		// 这里不转 int 的话订阅 JSON 里会是 "up_mbps": "100"，
-		// sing-box 不认字符串限速，整份订阅在客户端加载失败。
-		// 入站生成器同款写法（singbox.go SingBoxHy2Inbound）。
+		if start, end, err := ParseHopPorts(cfg.HopPorts); err == nil {
+			ob["server_ports"] = []string{fmt.Sprintf("%d:%d", start, end)}
+		}
+		// 限速必须是数字：Hy2Config 里存的是字符串，不转 int 会导致客户端加载失败。
 		if v, err := strconv.Atoi(cfg.UpMbps); err == nil && v > 0 {
 			ob["up_mbps"] = v
 		}
@@ -220,7 +221,6 @@ func ClientOutbounds(protocol, configJSON, address string, port int, sni, name s
 		ob["server"] = cfg.Domain
 		ob["username"] = cfg.Username
 		ob["password"] = cfg.Password
-		// Naive 面板策略：真域名 + CA 证书，客户端不跳过证书校验。
 		ob["tls"] = map[string]interface{}{"enabled": true, "server_name": cfg.Domain}
 		return []map[string]interface{}{ob}, nil, nil
 	case "snell":
@@ -232,7 +232,7 @@ func ClientOutbounds(protocol, configJSON, address string, port int, sni, name s
 		ob["psk"] = cfg.PSK
 		switch cfg.Version {
 		case 5:
-			// 服务端 v5 → 客户端 version=4（无 v5 客户端，见文件头注释）。
+			// 服务端 v5 → 客户端 version=4（无 v5 客户端）。
 			ob["version"] = 4
 			if cfg.ObfsMode != "" {
 				ob["obfs_mode"] = cfg.ObfsMode
@@ -254,7 +254,6 @@ func ClientOutbounds(protocol, configJSON, address string, port int, sni, name s
 		if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 			return nil, nil, err
 		}
-		// 复用节点弹窗那份双出站 JSON（SS detour 到 shadowtls）。
 		raw := ShadowTLSClientJSON(address, port, cfg, name)
 		var doc struct {
 			Outbounds []map[string]interface{} `json:"outbounds"`
@@ -271,13 +270,11 @@ func ClientOutbounds(protocol, configJSON, address string, port int, sni, name s
 		if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 			return nil, nil, err
 		}
-		// 1.13 起 wireguard 出站已移除：端点本身就是路由目标，
-		// tag 直接用节点名，选单里引用它（sing-box check 实测）。
 		ep := map[string]interface{}{
 			"type":        "wireguard",
 			"tag":         name,
 			"system":      false,
-			"mtu":         1420,
+			"mtu":         1280,
 			"address":     []string{cfg.ClientIP},
 			"private_key": cfg.ClientPriv,
 			"peers": []interface{}{map[string]interface{}{
@@ -303,8 +300,7 @@ func tlsClient(serverName string, insecure bool) map[string]interface{} {
 }
 
 // realityClientTLS：Reality 客户端 TLS。sing-box 强制要求 utls，
-// fingerprint 取入站配置，缺省 chrome（Trojan 的教训：
-// Reality 出站缺 utls 会在客户端报错）。
+// fingerprint 取入站配置，缺省 chrome。
 func realityClientTLS(serverName, publicKey, shortID, fingerprint string) map[string]interface{} {
 	if fingerprint == "" {
 		fingerprint = "chrome"
@@ -324,8 +320,7 @@ func realityClientTLS(serverName, publicKey, shortID, fingerprint string) map[st
 	return tls
 }
 
-// tlsDomain：TLS 档的域名回退链，与链接生成器一致：
-// Domain → SNI → 服务器地址。
+// tlsDomain：TLS 档的域名回退链，与链接生成器一致：Domain → SNI → 服务器地址。
 func tlsDomain(domain, sni, address string) string {
 	if domain != "" {
 		return domain
@@ -337,20 +332,13 @@ func tlsDomain(domain, sni, address string) string {
 }
 
 // transportOutbound：ws/h2/httpupgrade 客户端传输。
-// ws 与 httpupgrade 复用 singbox.go 的现成辅助函数。
+// 注意：sing-box 没有 "h2" 传输类型，HTTP/2 走 "type": "http"（配 TLS 即协商 H2），host 为 []string。
 func transportOutbound(mode, path, host string) map[string]interface{} {
 	switch mode {
 	case "ws":
 		return wsTransport(path, host)
 	case "h2":
-		t := map[string]interface{}{"type": "h2"}
-		if host != "" {
-			t["host"] = host
-		}
-		if path != "" {
-			t["path"] = path
-		}
-		return t
+		return httpTransport(host, path)
 	case "httpupgrade":
 		return httpUpgradeTransport(host, path)
 	}
@@ -358,15 +346,8 @@ func transportOutbound(mode, path, host string) map[string]interface{} {
 }
 
 // SingBoxClientConfig：订阅用的完整 sing-box 客户端配置。
-// nodeOutbounds 是各节点出站（含 direct 之前的全部节点），
-// endpoints 是 WireGuard 端点。Hiddify/sing-box 官方客户端、
-// Karing、NekoBox 直接把这份 JSON 当订阅导入。
-// 选单 tag 固定“🚀 节点选择”，DNS 走远端 8.8.8.8（经选单出站），
-// 内网地址直连，默认走第一个节点。
 func SingBoxClientConfig(nodeOutbounds []interface{}, endpoints []interface{}) map[string]interface{} {
 	const selectorTag = "🚀 节点选择"
-	// detour 目标（如 ShadowTLS 载体出站）不能直接选：它只是
-	// 内层出站的传输壳，单独选它连不上。选单只列能直连的出站。
 	detourTargets := map[string]bool{}
 	for _, o := range nodeOutbounds {
 		if m, ok := o.(map[string]interface{}); ok {
@@ -383,7 +364,6 @@ func SingBoxClientConfig(nodeOutbounds []interface{}, endpoints []interface{}) m
 			}
 		}
 	}
-	// WireGuard 没有出站，只有端点：端点 tag（即节点名）同样进选单。
 	for _, e := range endpoints {
 		if m, ok := e.(map[string]interface{}); ok {
 			if t, ok := m["tag"].(string); ok && t != "" {
@@ -442,21 +422,6 @@ func SingBoxClientConfig(nodeOutbounds []interface{}, endpoints []interface{}) m
 	}
 	return cfg
 }
-
-// ---------- 单行分享链接（订阅链接列表用） ----------
-//
-// 订阅链接列表是一行一个链接的 base64 文本，多行 JSON 在里面
-// 会被所有按行解析的客户端当碎行丢掉（2026-11-12 ShadowTLS
-// 在 Hiddify 里出不来的根因）。这里只产单行链接：
-//   - Naive：naive+https://user:pass@domain:port#name（标准格式，
-//     Hiddify/sing-box/sub2sing-box 都认）。
-//   - ShadowTLS：没有能用的单行链接形式。ss:// + plugin=shadow-tls
-//     在 sing-box 系报 plugin not found、在 mihomo 里超时
-//     （2026-11-12 实测），链接列表里不发；只在 sing-box JSON
-//     与 Clash YAML 里给。
-//   - WireGuard：sing-box 1.13 起 wireguard:// 链接无可用出站
-//     （改走 endpoint），链接列表里没有可靠的单行形式——
-//     不进链接列表，只在 sing-box JSON 与 Clash YAML 里给。
 
 // NaiveShareLink：Naive 单行分享链接。域名为空返回 ""（调用方跳过）。
 func NaiveShareLink(cfg NaiveConfig, port int, name string) string {

@@ -257,7 +257,11 @@ func listReleasesFreshFiltered(repo string, includePre bool) ([]Release, error) 
 	if err != nil {
 		return nil, err
 	}
-	url := base + "/repos/" + repo + "/releases?limit=30"
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	url := base + "/repos/" + repo + "/releases" + sep + "per_page=30&limit=30"
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -650,6 +654,7 @@ func extractTarGz(path, binName string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer gz.Close()
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()

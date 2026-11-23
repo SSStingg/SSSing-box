@@ -379,3 +379,60 @@ func fetchIP(url string) string {
 	}
 	return ip
 }
+
+// TCPConnectionsByPort 一次扫描统计各监听端口的 ESTABLISHED TCP 连接数。
+func TCPConnectionsByPort() map[int]int {
+	counts := map[int]int{}
+	parse := func(path string) {
+		f, err := os.Open(path)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			if len(fields) < 4 || fields[0] == "sl" || fields[3] != "01" {
+				continue
+			}
+			la := fields[1]
+			idx := strings.LastIndex(la, ":")
+			if idx < 0 {
+				continue
+			}
+			if p, err := strconv.ParseUint(la[idx+1:], 16, 32); err == nil {
+				counts[int(p)]++
+			}
+		}
+	}
+	parse("/proc/net/tcp")
+	parse("/proc/net/tcp6")
+	return counts
+}
+
+// UDPConntrackByPort 一次扫描统计 nf_conntrack 中各目标端口的 UDP 会话数。
+// 文件不存在（如无 conntrack 模块）时返回 ok=false，调用方按 -1 处理。
+func UDPConntrackByPort() (map[int]int, bool) {
+	f, err := os.Open("/proc/net/nf_conntrack")
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	counts := map[int]int{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.Contains(line, "udp") {
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			if strings.HasPrefix(field, "dport=") {
+				if p, err := strconv.Atoi(strings.TrimPrefix(field, "dport=")); err == nil {
+					counts[p]++
+					break
+				}
+			}
+		}
+	}
+	return counts, true
+}
